@@ -20,3 +20,5 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
 
 void convert_fp8(torch::Tensor& dst_cache, torch::Tensor& src_cache,
                  const double kv_scale, const std::string& kv_cache_dtype);
+
+
