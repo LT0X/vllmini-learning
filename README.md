@@ -8,11 +8,11 @@
 
 ### Prefill阶段
 
-  预填充阶段发生在模型接收到完整输入 Prompt 之后，但在开始生成第一个输出 token 之前。这个阶段的主要任务是处理输入的 Prompt，计算出所有输入 token 的上下文表示，并初始化后续解码阶段所需的数据结构 kvcache
+​	预填充阶段发生在模型接收到完整输入 Prompt 之后，但在开始生成第一个输出 token 之前。这个阶段的主要任务是处理输入的 Prompt，计算出所有输入 token 的上下文表示，并初始化后续解码阶段所需的数据结构 kvcache
 
-   当输入一段Prompt，需要进行对应的Tokenization, 将prompt处理为对应的 token, 然后再通过 Embedding层将离散的token映射为对应的高维向量以及加入对应的编码，转换为模型可以处理的形式,对于prompt每个token 通过 Embedding 隐射的高维向量进行拼接为 $X$，然后进行对应后续的计算，通过和transfomer训练得来的 权重矩阵 $W_Q, W_K, W_V$ ，进行对应矩阵乘法运算，得到 prompt的 token 对应的 Q，K，V 矩阵
+​	当输入一段Prompt，需要进行对应的Tokenization, 将prompt处理为对应的 token, 然后再通过 Embedding层将离散的token映射为对应的高维向量以及加入对应的编码，转换为模型可以处理的形式,对于prompt每个token 通过 Embedding 隐射的高维向量进行拼接为 $X$，然后进行对应后续的计算，通过和transfomer训练得来的 权重矩阵 $W_Q, W_K, W_V$ ，进行对应矩阵乘法运算，得到 prompt的 token 对应的 Q，K，V 矩阵
 
-  接下来，计算注意力分数。对于每个注意力头，我们将 Query 和 Key 的转置相乘。
+​	 接下来，计算注意力分数。对于每个注意力头，我们将 Query 和 Key 的转置相乘。
 
 
 $$
@@ -20,7 +20,7 @@ AttentionScore = Q \cdot K^T
 $$
 
 
-然后，对注意力分数进行缩放（除以 $\sqrt{head\_dim}$） Softmax 归一化，得到注意力权重矩阵，最后，将注意力权重与 Value 矩阵相乘，得到自注意力层的输出：
+​	然后，对注意力分数进行缩放（除以 $\sqrt{head\_dim}$） Softmax 归一化，得到注意力权重矩阵，最后，将注意力权重与 Value 矩阵相乘，得到自注意力层的输出：
 
 
 $$
@@ -28,17 +28,17 @@ AttentionOutput = AttentionWeight \cdot V
 $$
 
 
-得到注意力层的输出以后，需要将输入序列的`k`和`v`存入 kv 缓存。之后注意力输出矩阵，会先经过前馈神经网络，然后经线性层 + softmax 预测下一个 token 的概率，模型会选择概率最高的 token 作为第一个输出。至此，从注意力输出矩阵到第一个 token 的预测完成。
+​	得到注意力层的输出以后，需要将输入序列的`k`和`v`存入 kv 缓存。之后注意力输出矩阵，会先经过前馈神经网络，然后经线性层 + softmax 预测下一个 token 的概率，模型会选择概率最高的 token 作为第一个输出。至此，从注意力输出矩阵到第一个 token 的预测完成。
 
-  预填充阶段的一个关键优势在于其高度的并行性，由于整个输入 Prompt 在开始时是已知的，模型利用矩阵可以同时计算所有 token 在每一层的表示。这种处理方式使得即使在较小的batch size下也能使得GPU的利用率很高，如在prefill阶段需要处理长输入，则这个阶段的计算开销会比较大，显卡利用率很容易打满了。如果增大batch size时，prefill阶段每个token的处理开销几乎保持不变，这意味着prefill的效率在小batch size时就已经非常高，说明开销是一定的。
+ 	预填充阶段的一个关键优势在于其高度的并行性，由于整个输入 Prompt 在开始时是已知的，模型利用矩阵可以同时计算所有 token 在每一层的表示。这种处理方式使得即使在较小的batch size下也能使得GPU的利用率很高，如在prefill阶段需要处理长输入，则这个阶段的计算开销会比较大，显卡利用率很容易打满了。如果增大batch size时，prefill阶段每个token的处理开销几乎保持不变，这意味着prefill的效率在小batch size时就已经非常高，说明开销是一定的。
 
 ### Decode阶段
 
-  解码阶段在预填充阶段完成之后开始。在这个阶段，模型以自回归的方式逐个生成输出 token。每生成一个 token，该 token 就会被添加到已生成的序列中，并作为下一步生成的输入。
+​	 解码阶段在预填充阶段完成之后开始。在这个阶段，模型以自回归的方式逐个生成输出 token。每生成一个 token，该 token 就会被添加到已生成的序列中，并作为下一步生成的输入。
 
-  在Decode阶段大部分的执行的操作和Prefill阶段有相同的地方，但不同的是prefill可以并行处理多个token和计算相关的注意力矩阵的，Decode阶段则 以自回归的方式 把上一次生成的token 添加到之前的序列作为输入进行逐个生成 token,在这一阶段为了提升对应的速度， 会充分利用之前在 prefill阶段生成的 KV缓存吗，同时在之后的阶段 添加和维护这个KV缓存。
+​	在Decode阶段大部分的执行的操作和Prefill阶段有相同的地方，但不同的是prefill可以并行处理多个token和计算相关的注意力矩阵的，Decode阶段则 以自回归的方式 把上一次生成的token 添加到之前的序列作为输入进行逐个生成 token,在这一阶段为了提升对应的速度， 会充分利用之前在 prefill阶段生成的 KV缓存吗，同时在之后的阶段 添加和维护这个KV缓存。
 
-  首先decode阶段会接受来自上一层生成token，由于之前已经缓存了之前序列对应的k,v向量，在此阶段只需要 计算该token对应  Q，K，V 向量，将当前生成 token 的 Key 和 Value 向量更新到 KV 缓存中。在自注意力计算中，当前 token 的 Query 向量会与 KV 缓存中所有历史 token 的 Key 向量进行比较，计算注意力权重。Value 向量会根据这些权重进行加权求和，得到上下文向量。模型最后一层的输出会经过线性层和 Softmax 函数，得到下一个 token 的概率分布。根据解码策略从概率分布中选择下一个 token。
+​	首先decode阶段会接受来自上一层生成token，由于之前已经缓存了之前序列对应的k,v向量，在此阶段只需要 计算该token对应  Q，K，V 向量，将当前生成 token 的 Key 和 Value 向量更新到 KV 缓存中。在自注意力计算中，当前 token 的 Query 向量会与 KV 缓存中所有历史 token 的 Key 向量进行比较，计算注意力权重。Value 向量会根据这些权重进行加权求和，得到上下文向量。模型最后一层的输出会经过线性层和 Softmax 函数，得到下一个 token 的概率分布。根据解码策略从概率分布中选择下一个 token。
 
 ### **性能瓶颈**
 
@@ -48,6 +48,7 @@ $$
 ## vllmini
 
 ### 项目的架构图
+
 ![image.png](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/24688814debc4c3ab1b3cd34033c4e73~tplv-k3u1fbpfcp-watermark.image?)
 
 ### server
@@ -125,7 +126,7 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ​	验证通过则进行decode阶段的处理，首先通过 `next_token = self.sample_next_token(seq_id) `获取 前一次推理所得到的next_token,函数主要通过读取本地维护的哈希字典last_logits，得到预测最后一个token的logits,然后进行 temperature运算进行温度缩放，原始代码中temperature = 1.0 则保持原始分布，再通过top-k 选取前50个概率最高的分布，然后再通过soft-max进行转换概率分布，并通过multinomial()对概率分布随机的选取对应的目标token的索引，并返回对应的结果得到最终的next_token。
 
-​	再下一个阶段则是向block_manage 进行 decode资源的申请，并调用模型进行forward()推理，得到推理所得到token的logits,提取并保存最后一个在本地的哈希字典中，接着会进行一些验证，检查是否推理已经完成生成（遇到EOS或达到最大长度），如已经完成，则调用 `remove_sequence_from_processing()` 对本地维护哈希字典进行一些kv值的删除，再通过block_manage进行申请资源的释放，如未完成，则进行另外的逻辑的处理，首先schedualer 会在服务的整个生命周期进行运行run()函数，然后进行会不断的检查 优先队列是否有对应的序列需要处理，所以如果推理还未完成，则会重新加入到优先队列中，由于python的 优先队列的数据结构实现是由小顶堆实现的，因为序列的id是请求到达时间戳所生成的，同时代码中进行队列put()操作，所使用的比较优先级的元素则使用了时间戳，根据小顶堆的特性，整体的任务调度实现有点类似操作系统任务调度的“先来先服务”的调度策略，在整个任务调度器 调度策略方面实现稍微单调了一些，在真正实际的可能得考虑多方面的优化，比如整个调度器主要的实现的是单线程的不断轮询查找队列是否需要处理，如果轮询时间设置不当，很容易造成性能的浪费，同时如果先来先服务的话，意味着不把前一个时间戳 序列任务处理完成的话，后续的请求推理都不会被执行，当某个时间戳序列任务 因为某些情况迟迟无法完成，可能导致后续系统无法正常运行，在之前prefill申请的资源也无法释放，可能导致内存泄漏的风险，当然了，这是是整个系统设计方面的事情了，而且项目的Redeme文档就说明了，项目主要的初衷是学习为主。
+​	再下一个阶段则是向block_manage 进行 decode资源的申请，并调用模型进行forward()推理，得到推理所得到token的logits,提取并保存最后一个在本地的哈希字典中，接着会进行一些验证，检查是否推理已经完成生成（遇到EOS或达到最大长度），如已经完成，则调用 `remove_sequence_from_processing()` 对本地维护哈希字典进行一些kv值的删除，再通过block_manage进行申请资源的释放，如未完成，则进行另外的逻辑的处理，首先schedualer 会在服务的整个生命周期进行运行run()函数，然后进行会不断的检查 优先队列是否有对应的序列需要处理，所以如果推理还未完成，则会重新加入到优先队列中，由于python的 优先队列的数据结构实现是由小顶堆实现的，因为序列的id是请求到达时间戳所生成的，同时代码中进行队列put()操作，所使用的比较优先级的元素则使用了时间戳，根据小顶堆的特性，整体的任务调度实现有点类似操作系统任务调度的“先来先服务”的调度策略，在整个任务调度器 调度策略方面实现稍微单调了一些，在真正实际的可能得考虑多方面的优化，比如整个调度器主要的实现的是单线程的不断轮询查找队列是否需要处理，如果轮询时间设置不当，很容易造成性能的浪费，同时如果先来先服务的话，意味着不把前一个时间戳 序列任务处理完成的话，后续的请求推理都不会被执行，当某个时间戳序列任务 因为某些情况迟迟无法完成，可能导致后续系统无法正常运行，在之前prefill申请的资源也无法释放，可能导致内存泄漏的风险，虽然程序有异常捕抓机制检测资源的分配的问题，但不能完全解决问题。当然了，这是是整个系统设计方面的事情了，而且项目的Redeme文档就说明了，项目主要的初衷是学习为主。
 
 ```python
  def run(self):
@@ -192,5 +193,31 @@ def add_sequence(self, input_ids: torch.Tensor):
                     raise e
 ```
 
+​	在整个run() 运行期间会通过try关键字捕抓异常，捕抓的异常识别通用异常为主，当出现异常后，进行异常处理情况，为申请资源失败的情况，则是cuda 显存不足，处理为调用handle_out_of_memory()函数处理资源分配问题，按照我的理解应该是，代码应该移除最老的序列id,以持来为最新的序列id让出显存资源，但是实现中 是运用了 max()函数，先通过生成器表达式筛选不包含本次序列id的id列表,然后在通过key=self.active_sequences.get，作为比较的依据，获取最大的时间戳的 序列的id，这样的话，因为max的原因就变成了优先删除较处理序列id最新的序列任务，并不是我理解优先处理最老的序列任务，来为新序列任务让出资源，这里我并没有理解作者这样做的原因。
 
+```python
+   def handle_out_of_memory(self, batch_seq_ids: List[int]):
+        """处理内存不足的情况，这里按理说应该是移除最老的序列以释放内存，
+        但代码的实现是移除了最新的时间戳序列id,那移除的是最新的序列任务了
+        """
+        print("Handling out of memory")
+        if self.active_sequences:
+            
+            seq_to_remove = max(
+                (seq for seq in self.active_sequences if seq not in batch_seq_ids),
+                key=c,
+                default=None
+            )
+            if seq_to_remove is None:
+                seq_to_remove = max(self.active_sequences, key=self.active_sequences.get)
+            print(f"Removing sequence {seq_to_remove} due to memory constraints")
+            self.remove_sequence_from_processing(seq_to_remove)
+        else:
+            print("No active sequences to remove")
+
+```
+
+
+
+### block_manager
 
