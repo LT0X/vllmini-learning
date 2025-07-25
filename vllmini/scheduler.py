@@ -127,7 +127,7 @@ class Scheduler:
 
     def handle_out_of_memory(self, batch_seq_ids: List[int]):
         """处理内存不足的情况，这里按理说应该是移除最老的序列以释放内存，
-        但代码的实现是移除了最新的时间戳序列ids,那移除的是最新的序列任务了
+        但代码的实现是移除了最新的时间戳序列id,那移除的是最新的序列任务了
         """
         print("Handling out of memory")
         if self.active_sequences:

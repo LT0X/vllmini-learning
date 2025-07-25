@@ -27,10 +27,9 @@ $$
 AttentionOutput = AttentionWeight \cdot V
 $$
 
-
 ​	得到注意力层的输出以后，需要将输入序列的`k`和`v`存入 kv 缓存。之后注意力输出矩阵，会先经过前馈神经网络，然后经线性层 + softmax 预测下一个 token 的概率，模型会选择概率最高的 token 作为第一个输出。至此，从注意力输出矩阵到第一个 token 的预测完成。
 
- 	预填充阶段的一个关键优势在于其高度的并行性，由于整个输入 Prompt 在开始时是已知的，模型利用矩阵可以同时计算所有 token 在每一层的表示。这种处理方式使得即使在较小的batch size下也能使得GPU的利用率很高，如在prefill阶段需要处理长输入，则这个阶段的计算开销会比较大，显卡利用率很容易打满了。如果增大batch size时，prefill阶段每个token的处理开销几乎保持不变，这意味着prefill的效率在小batch size时就已经非常高，说明开销是一定的。
+​	预填充阶段的一个关键优势在于其高度的并行性，由于整个输入 Prompt 在开始时是已知的，模型利用矩阵可以同时计算所有 token 在每一层的表示。这种处理方式使得即使在较小的batch size下也能使得GPU的利用率很高，如在prefill阶段需要处理长输入，则这个阶段的计算开销会比较大，显卡利用率很容易打满了。如果增大batch size时，prefill阶段每个token的处理开销几乎保持不变，这意味着prefill的效率在小batch size时就已经非常高，说明开销是一定的。
 
 ### Decode阶段
 
@@ -49,7 +48,7 @@ $$
 
 ### 项目的架构图
 
-![image.png](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/24688814debc4c3ab1b3cd34033c4e73~tplv-k3u1fbpfcp-watermark.image?)
+![image.png](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/a15126b2b24f419d86c9ae43f9b67c60~tplv-k3u1fbpfcp-watermark.image?)
 
 ### server
 
@@ -217,7 +216,54 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ```
 
+### KVCache
+
+​	kvCache是一个里面的关键类，也是优化推理速度的一个重要机制，block_manager初始化后，会在其初始化中一并初始化KVCache类，在初始化KVCache，会根据模型对应的一些参数来进行初始化，并以此申请对应的kvcache资源，同时为了判断分配资源，为此在本地维护4个哈希字典。
+
+```
+# 初始化Key缓存张量（特殊形状用于显存优化，实际等效于[num_blocks, num_heads, block_size, head_size]）
+        # 形状：[块数, 注意力头数, head_size//8, 块大小, 8]（float16占2字节，此处通过拆分维度优化访问效率）
+        self.key_cache = torch.zeros(
+            num_blocks, num_heads, head_size // 8, block_size, 8, 
+            dtype=torch.float16, device='cuda'
+        )
+        # 初始化Value缓存张量（形状：[块数, 注意力头数, 头维度, 块大小]）
+        self.value_cache = torch.zeros(
+            num_blocks, num_heads, head_size, block_size, 
+            dtype=torch.float16, device='cuda'
+        )
+
+        # 空闲块列表（记录当前未被使用的块ID）
+        self.free_blocks = list(range(num_blocks))
+        # 已分配块映射（序列ID -> 该序列占用的块ID列表）
+        self.allocated_blocks: Dict[int, List[int]] = {}
+        # 块表（序列ID -> [(块ID, 已填充token数), ...]，记录每个块的使用状态）
+        self.block_tables: Dict[int, List[Tuple[int, int]]] = {}
+        # 分页注意力块表（序列ID -> 按层组织的块索引列表，用于分页注意力计算）
+        # 结构：[ [layer0的块列表], [layer1的块列表], ... ]，未使用位置用-1填充
+        self.paged_attention_block_tables: Dict[int, List[List[int]]] = {}
+```
+
+​	KV Cache是一种为大模型推理加速技术。在大模型推理的逻辑是：根据当前轮输入tokens预测并输出下一个token，这两者拼接就得到了下一轮的输入，每一轮只比上一轮增加了一个token。这意味着当前轮包含了上一轮的部分计算。上一轮中每一层attention layer的key和value被当前轮复用，而不是重新计算，就能加速推理过程，这就是KV Cache的作用。
+
+​	之前也说过大模型的推理被分为了Prefill和Decode两个阶段。简单来说，Prefill阶段将prompt喂给模型做forward计算，该过程一次性计算了每个prompt token对应的key和value，并且被缓存起来；在Decode阶段，模型每foward一次生成一个token。这两个阶段有较为明显的差异。
+
+​	同时对于有多个级联的block的情况下，每一层都会保存上一轮的KV_cache以提供本轮的计算使用。
+
+​	当时在学习kv缓存的机制的时候，也有一些可行性的疑问，因为现有大模型往往有`N`个`(Transformer) Block`，每个block都有对应的自注意力块，第一层的kv缓存信息自不用说，但是从第二层的kv缓存信息，是由前一层的输出作为输入得到的，如果前一层的输出改变了，按理来说第二层及以后的缓存不会失效吗，当然了，大概率还是我理解的机制的理解问题，要不然kvcache也不会在业界大规模的应用，甚至是推理的一个标配，所以上网查询一些相关博客，刚好找到一个对应的[博客](https://blog.csdn.net/daihaoguang/article/details/141515660)有解释这方面的疑问，
+
+​	如下图所示，刨除前面的b和np这两个维度，则当前轮Attention的形状为[sq, hn]，如下图中左侧的Attention部分所示；那么下一轮序列长度增加1，形状变成了[s+1, hn] = [sq', hn]。图中Attention蓝色部分表示当前轮需要计算的部分，而绿色部分则表示下一轮新添加的部分。
+
+​	证明的可行性则只需要证明本轮和下一轮在`Attention`的蓝色部分计算结果是一致的。因为这部分一致保证了前后两轮在级联的`Block`中`attention layer`中`key`和`value`的前`sk`个也是一致的的，因为新的一轮也只是向sk的方向去增长。
+
+​	按计算注意力的步骤，首先由Q和K^T的进行相乘，按矩阵乘法的计算规则，得到QK^T 在前一轮前sk列是一致，即是蓝色部分，然后就是进行掩码操作，由于对于每一个token只能看到之前的内容以此来预测，所以进行mask操作，表现的形式，则是对注意力分数矩阵进行上三角赋予一个-inf，再经过softmax得到概率分布数值表现为0，所以在与v矩阵相乘（注意是 Attention Prob * V）得到注意力矩阵的时候，根据矩阵相乘的计算规则，得到的注意力矩阵最后的与前一轮的蓝色部分是一致的。所以关键即是mask的操作，使得数据为0，
+
+使得计算的时候，只能看到前面的value,而看不到后面的value。最终得到KVcache在多个block是有效的。
+
+![](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/e2de9900b5134fe69caca33cc3ebe496~tplv-k3u1fbpfcp-watermark.image?)
 
 
-### block_manager
 
+#### page_attention
+
+​	分配资源的问题的 

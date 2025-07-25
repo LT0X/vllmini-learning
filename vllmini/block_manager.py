@@ -146,7 +146,7 @@ class BlockManager:
             # 更新块表中最后一个块的填充数量（+输入长度，通常为1）
             self.kv_cache.update_block_table(seq_id, last_block, num_filled + input_len)
 
-        # 获取更新后的分页注意力块表
+        # 获取更新后的分页注意力块表/
         paged_attention_block_table = self.kv_cache.get_paged_attention_block_table(seq_id)        
 
         return paged_attention_block_table, new_slot_mapping
