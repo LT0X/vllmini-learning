@@ -250,20 +250,38 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ​	同时对于有多个级联的block的情况下，每一层都会保存上一轮的KV_cache以提供本轮的计算使用。
 
+​	由于KVCache的作用，在模型进行预测下一个token的时候，只需要单独进行最新token的 Q，K，V向量，Q是当前 token 的查询向量，表示 “我需要关注哪些信息”,所以Q 仅与当前 token 相关，不依赖历史信息，因此**无需与之前的 Q 拼接**，**所以Q无需进行缓存**.
+
+- - K 是所有 token 的 “索引标签”，表示 “我是哪个位置的信息”。
+  - V 是所有 token 的 “内容载体”，包含实际的语义信息。
+
+  所以Key和 Value需要累积拼接，从而形成全局上下文,从而为了加快计算速度，从而进行Key和Value进行缓存，也是一种空间换时间的思想。
+
 ​	当时在学习kv缓存的机制的时候，也有一些可行性的疑问，因为现有大模型往往有`N`个`(Transformer) Block`，每个block都有对应的自注意力块，第一层的kv缓存信息自不用说，但是从第二层的kv缓存信息，是由前一层的输出作为输入得到的，如果前一层的输出改变了，按理来说第二层及以后的缓存不会失效吗，当然了，大概率还是我理解的机制的理解问题，要不然kvcache也不会在业界大规模的应用，甚至是推理的一个标配，所以上网查询一些相关博客，刚好找到一个对应的[博客](https://blog.csdn.net/daihaoguang/article/details/141515660)有解释这方面的疑问，
 
 ​	如下图所示，刨除前面的b和np这两个维度，则当前轮Attention的形状为[sq, hn]，如下图中左侧的Attention部分所示；那么下一轮序列长度增加1，形状变成了[s+1, hn] = [sq', hn]。图中Attention蓝色部分表示当前轮需要计算的部分，而绿色部分则表示下一轮新添加的部分。
 
 ​	证明的可行性则只需要证明本轮和下一轮在`Attention`的蓝色部分计算结果是一致的。因为这部分一致保证了前后两轮在级联的`Block`中`attention layer`中`key`和`value`的前`sk`个也是一致的的，因为新的一轮也只是向sk的方向去增长。
 
-​	按计算注意力的步骤，首先由Q和K^T的进行相乘，按矩阵乘法的计算规则，得到QK^T 在前一轮前sk列是一致，即是蓝色部分，然后就是进行掩码操作，由于对于每一个token只能看到之前的内容以此来预测，所以进行mask操作，表现的形式，则是对注意力分数矩阵进行上三角赋予一个-inf，再经过softmax得到概率分布数值表现为0，所以在与v矩阵相乘（注意是 Attention Prob * V）得到注意力矩阵的时候，根据矩阵相乘的计算规则，得到的注意力矩阵最后的与前一轮的蓝色部分是一致的。所以关键即是mask的操作，使得数据为0，
+​	按计算注意力的步骤，首先由Q和K^T的进行相乘，按矩阵乘法的计算规则，得到QK^T 在前一轮前sk列是一致，即是蓝色部分，然后就是进行掩码操作，由于对于每一个token只能看到之前的内容以此来预测，所以进行mask操作，表现的形式，则是对注意力分数矩阵进行上三角赋予一个-inf，再经过softmax得到概率分布数值表现为0，所以在与v矩阵相乘（注意是 Attention Prob * V）得到注意力矩阵的时候，根据矩阵相乘的计算规则，得到的注意力矩阵最后的与前一轮的蓝色部分是一致的。所以关键即是mask的操作，使得数据为0， 使得计算的时候，只能看到前面的value,而看不到后面的value。最终得到KVcache在多个block是有效的。
 
-使得计算的时候，只能看到前面的value,而看不到后面的value。最终得到KVcache在多个block是有效的。
-
-![](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/e2de9900b5134fe69caca33cc3ebe496~tplv-k3u1fbpfcp-watermark.image?)
-
-
+![ ](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/e2de9900b5134fe69caca33cc3ebe496~tplv-k3u1fbpfcp-watermark.image?)
 
 #### page_attention
 
-​	分配资源的问题的 
+​	对于大模型的推理中，有一个需要面对的问题则是关于序列资源的分配的问题，也就是对显存进行预分配，一般来说，在大模型的推理中往往不知道token的生成数量，如果我们预分配资源为设定为最大值，就可能会造成以下的一些浪费。
+
+- 预分配，但不会用到。就比如设定最大分配的大小为 500 token，但实际推理 到100token就已经结束了，那么之后分配的空间就已经得到浪费。
+- 预分配，但尚为用到。如分配了最大的token为500，但实际推理的也刚好满足500token，但是当推理到前10个token，后面还有许多token没有用到，刚刚好已经没有对应的显存了，但同时后面的请求只需要生成几十个token就可完成任务，这时候会导致后续的任务无法继续运行。
+- 这样的分配的制度，可能会导致许多的显存碎片，这些碎片无法满足后续的请求，导致资源浪费。
+
+​	这些问题是不是有些熟悉，在操作系统中，我们学习的内存分配的时候，也有一些类似的问题，当时是通过引入逻辑地址和页管理机制来实现对进程内存的分配，page_attention 就是类似于操作系统的页表机制，引入page_attention来帮助解决序列分配现存的问题。
+
+​	首先，page_attention 会把显存划分为以block单位，每个block可以存储若干个token，然后，类似于操作系统中页表机制以及虚拟内存，对于每一个请求，有逻辑kvcache和 物理显存kvcache，其中请求逻辑kvcache是连续的，而实际的存放token的物理显存kvcache可以不连续，每一个请求都有维护一个映射表来 映射逻辑kvcache和物理kvcache。从而达到对显存的高效分配，
+
+​	page_attention可以做到按需分配，不提前分配，按block分配，以此减少碎片大小，同时使用逻辑kvcache，方便实现调用。
+
+![image.png](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/9e3fb595aee645f884026f98a2ef4b24~tplv-k3u1fbpfcp-watermark.image?)
+
+![image.png](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/878750e8aa7d4b60a9e1eb65e20a5b54~tplv-k3u1fbpfcp-watermark.image?)
+
