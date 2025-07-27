@@ -285,3 +285,59 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ![image.png](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/878750e8aa7d4b60a9e1eb65e20a5b54~tplv-k3u1fbpfcp-watermark.image?)
 
+
+
+​	`allocate_prefill()`主要的作用是为大模型prefill推理阶段分配KVcache资源，首先的话，由于之前已经说明，在Transformer 模型中，每层都有自己独立的 KV 缓存。因此，对于一个序列，我们需要为每一层分配一个块来存储该层的 KV 值。这就是为什么需要分配`num_layers`个块的原因，接下来的话则是开始分配，具体的实现，是通过对本地维护的四个表进行更新，后续通过以此判断来调用kvcahce，`free_blocks`和`allocated_blocks` 的更新很容易理解，重点是后面两个表的更新，`block_tables`首先这个表的数据结构为`Dict[int, List[Tuple[int, int]]]`  是一个哈希表，key为请求序列id，value是一个存储着二元元组list的数据结构，主要存储的作用是分配的block块和有效长度，  `self.block_tables[seq_id] = [(block, min(seq_len, self.block_size)) for block in allocated]` 这个代码，遍历了所有分配的 allocatedd的block,然后通过`min(seq_len, self.block_size)` ，为每一个block进行有效长度的赋值，为什么使用的min()的原因是
+
+- **当 `seq_len > block_size` 时**：序列需要被分割到多个块中，每个块的有效长度最大为 `block_size`。
+- **当 `seq_len < block_size` 时**：序列可以完整放入一个块，但只需使用块的前 `seq_len` 个位置，剩余空间闲置。
+
+​	这样的话可以很好的 **避免越界访问**，内存块按固定大小分配，但序列长度不一致。同时不会读取 / 写入超过块大小的位置（防止内存越界）。不会遗漏序列的任何 token（最后一个块可能不满，但仍会记录实际长度）。
+
+​	同时下一个 `paged_attention_block_tables` ，首先其的数据结构为 `Dict[int, List[List[int]]]`同样是哈希表，但是这个是一个三层结构，依旧是用序列Id作为key，但是value代表的是 最外层代表序列id的所有层所分配的block,而里面的list代表的是每一层所分配的block,`max_blocks_per_seq`定义了**每个层最多可以使用的块数量**。这是为了处理长序列的情况：当序列长度超过一个块的大小时，需要多个块来存储该层的 KV 缓存。每个张量`[[block] + [-1] * (self.max_blocks_per_seq - 1)]`表示一个层的块列表。初始时，每个层只分配一个块，因此列表中只有第一个位置有有效的块 ID，其余位置用`-1`填充。
+
+​	**这种设计的好处是当序列需要更多块时，可以动态更新这个列表，替换`-1`为新分配的块 ID**。
+
+```python
+ def allocate_for_prefill(self, seq_id: int, num_layers: int, seq_len: int) -> Tuple[List[int], List[torch.Tensor], List[List[int]]]:
+        """
+        为预填充阶段（prefill）分配KV缓存块
+        预填充阶段是对输入序列的首次处理（如用户输入的prompt），需要为每个Transformer层分配初始块，
+        存储该层的注意力键值对（KV）。
+         
+        参数：
+            seq_id: 序列唯一标识ID
+            num_layers: 模型的Transformer层数（每个层需要独立的KV缓存块）
+            seq_len: 输入序列的长度（token数量）
+        
+        返回：
+            分配的块ID列表、槽映射（token到缓存位置的映射）、分页注意力块表
+        """
+        # 检查是否有足够的空闲块（至少需要与层数相同的块数）
+        if len(self.free_blocks) < num_layers:
+            raise RuntimeError("预填充分配时没有足够的空闲块")
+
+        # 从空闲块中分配num_layers个块（取前num_layers个）
+        allocated = self.free_blocks[:num_layers]
+        self.free_blocks = self.free_blocks[num_layers:]  # 更新空闲块列表
+        self.allocated_blocks[seq_id] = allocated  # 记录序列分配的块
+        
+        # 初始化块表：每个块的已填充数量为min(序列长度, 块大小)（块可能装不下整个序列）
+        self.block_tables[seq_id] = [(block, min(seq_len, self.block_size)) for block in allocated]
+        # 初始化分页注意力块表：每个层对应一个块列表，用-1填充未使用的位置（最多max_blocks_per_seq个块）
+        self.paged_attention_block_tables[seq_id] = [
+            torch.tensor(
+                [[block] + [-1] * (self.max_blocks_per_seq - 1)],  # 结构：[块ID, -1, -1, ...]
+                device="cuda", dtype=torch.int32
+            ) for block in allocated
+        ]
+
+        # 计算槽映射（slot mappings）：每个token在缓存中的位置（块ID * 块大小 + token在块内的偏移）
+        slot_mappings = [
+            torch.arange(seq_len, dtype=torch.long, device='cuda') + block * self.block_size 
+            for block in allocated
+        ]
+
+        return allocated, slot_mappings, self.paged_attention_block_tables[seq_id]
+```
+
