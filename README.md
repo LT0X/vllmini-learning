@@ -48,7 +48,9 @@ $$
 
 ### 项目的架构图
 
-![image.png](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/a15126b2b24f419d86c9ae43f9b67c60~tplv-k3u1fbpfcp-watermark.image?)
+![123](https://i-blog.csdnimg.cn/direct/ad1eec6c90074183a803ef5dcc090ee5.png)
+
+
 
 ### server
 
@@ -125,7 +127,7 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ​	验证通过则进行decode阶段的处理，首先通过 `next_token = self.sample_next_token(seq_id) `获取 前一次推理所得到的next_token,函数主要通过读取本地维护的哈希字典last_logits，得到预测最后一个token的logits,然后进行 temperature运算进行温度缩放，原始代码中temperature = 1.0 则保持原始分布，再通过top-k 选取前50个概率最高的分布，然后再通过soft-max进行转换概率分布，并通过multinomial()对概率分布随机的选取对应的目标token的索引，并返回对应的结果得到最终的next_token。
 
-​	再下一个阶段则是向block_manage 进行 decode资源的申请，并调用模型进行forward()推理，得到推理所得到token的logits,提取并保存最后一个在本地的哈希字典中，接着会进行一些验证，检查是否推理已经完成生成（遇到EOS或达到最大长度），如已经完成，则调用 `remove_sequence_from_processing()` 对本地维护哈希字典进行一些kv值的删除，再通过block_manage进行申请资源的释放，如未完成，则进行另外的逻辑的处理，首先schedualer 会在服务的整个生命周期进行运行run()函数，然后进行会不断的检查 优先队列是否有对应的序列需要处理，所以如果推理还未完成，则会重新加入到优先队列中，由于python的 优先队列的数据结构实现是由小顶堆实现的，因为序列的id是请求到达时间戳所生成的，同时代码中进行队列put()操作，所使用的比较优先级的元素则使用了时间戳，根据小顶堆的特性，整体的任务调度实现有点类似操作系统任务调度的“先来先服务”的调度策略，在整个任务调度器 调度策略方面实现稍微单调了一些，在真正实际的可能得考虑多方面的优化，比如整个调度器主要的实现的是单线程的不断轮询查找队列是否需要处理，如果轮询时间设置不当，很容易造成性能的浪费，同时如果先来先服务的话，意味着不把前一个时间戳 序列任务处理完成的话，后续的请求推理都不会被执行，当某个时间戳序列任务 因为某些情况迟迟无法完成，可能导致后续系统无法正常运行，在之前prefill申请的资源也无法释放，可能导致内存泄漏的风险，虽然程序有异常捕抓机制检测资源的分配的问题，但不能完全解决问题。当然了，这是是整个系统设计方面的事情了，而且项目的Redeme文档就说明了，项目主要的初衷是学习为主。
+​	再下一个阶段则是向block_manage 进行 decode资源的申请，并调用模型进行forward()推理，得到推理所得到token的logits,提取并保存最后一个在本地的哈希字典中，接着会进行一些验证，检查是否推理已经完成生成（遇到EOS或达到最大长度），如已经完成，则调用 `remove_sequence_from_processing()` 对本地维护哈希字典进行一些kv值的删除，再通过block_manage进行申请资源的释放，如未完成，则进行另外的逻辑的处理，首先schedualer 会在服务的整个生命周期进行运行run()函数，然后进行会不断的检查 优先队列是否有对应的序列需要处理，所以如果推理还未完成，则会重新加入到优先队列中，由于python的 优先队列的数据结构实现是由小顶堆实现的，因为序列的id是请求到达时间戳所生成的，同时代码中进行队列put()操作，所使用的比较优先级的元素则使用了时间戳，根据小顶堆的特性，整体的任务调度实现有点类似操作系统任务调度的“先来先服务”的调度策略，在整个任务调度器 调度策略方面实现稍微单调了一些，在真正实际的可能得考虑多方面的优化，比如整个调度器主要的实现的是单线程的不断轮询查找队列是否需要处理，如果轮询时间设置不当，很容易造成性能的浪费，同时如果先来先服务的话，意味着不把前一个时间戳 序列任务处理完成的话，后续的请求推理都不会被执行，当某个时间戳序列任务 因为某些情况迟迟无法完成，可能导致后续系统无法正常运行，在之前prefill申请的资源也无法释放，可能导致内存泄漏的风险，虽然程序有异常捕抓机制检测资源的分配的问题，但不能完全解决问题。当然了，这是是整个系统设计方面的事情了，而且项目的Readme文档就说明了，项目主要的初衷是学习为主。
 
 ```python
  def run(self):
@@ -192,7 +194,7 @@ def add_sequence(self, input_ids: torch.Tensor):
                     raise e
 ```
 
-​	在整个run() 运行期间会通过try关键字捕抓异常，捕抓的异常识别通用异常为主，当出现异常后，进行异常处理情况，为申请资源失败的情况，则是cuda 显存不足，处理为调用handle_out_of_memory()函数处理资源分配问题，按照我的理解应该是，代码应该移除最老的序列id,以持来为最新的序列id让出显存资源，但是实现中 是运用了 max()函数，先通过生成器表达式筛选不包含本次序列id的id列表,然后在通过key=self.active_sequences.get，作为比较的依据，获取最大的时间戳的 序列的id，这样的话，因为max的原因就变成了优先删除较处理序列id最新的序列任务，并不是我理解优先处理最老的序列任务，来为新序列任务让出资源，这里我并没有理解作者这样做的原因。
+​	在整个run() 运行期间会通过try关键字捕抓异常，捕抓的异常识别通用异常为主，当出现异常后，进行异常处理情况，为申请资源失败的情况，则是cuda 显存不足，处理为调用handle_out_of_memory()函数处理资源分配问题，按照我的理解应该是，代码应该移除最老的序列id,以持来为最新的序列id让出显存资源，但是实现中 是运用了 max()函数，先通过生成器表达式筛选不包含本次序列id的id列表,然后在通过key=self.active_sequences.get，作为比较的依据，获取最大的时间戳的 序列的id，这样的话，因为max的原因就变成了优先删除较处理序列id最新的序列任务，并不是我理解优先释放最老的序列任务的资源，来为新序列任务让出资源，这里我并没有理解作者这样做的原因。
 
 ```python
    def handle_out_of_memory(self, batch_seq_ids: List[int]):
@@ -265,7 +267,7 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ​	按计算注意力的步骤，首先由Q和K^T的进行相乘，按矩阵乘法的计算规则，得到QK^T 在前一轮前sk列是一致，即是蓝色部分，然后就是进行掩码操作，由于对于每一个token只能看到之前的内容以此来预测，所以进行mask操作，表现的形式，则是对注意力分数矩阵进行上三角赋予一个-inf，再经过softmax得到概率分布数值表现为0，所以在与v矩阵相乘（注意是 Attention Prob * V）得到注意力矩阵的时候，根据矩阵相乘的计算规则，得到的注意力矩阵最后的与前一轮的蓝色部分是一致的。所以关键即是mask的操作，使得数据为0， 使得计算的时候，只能看到前面的value,而看不到后面的value。最终得到KVcache在多个block是有效的。
 
-![ ](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/e2de9900b5134fe69caca33cc3ebe496~tplv-k3u1fbpfcp-watermark.image?)
+![](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/e2de9900b5134fe69caca33cc3ebe496~tplv-k3u1fbpfcp-watermark.image?)
 
 #### page_attention
 
@@ -281,11 +283,9 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ​	page_attention可以做到按需分配，不提前分配，按block分配，以此减少碎片大小，同时使用逻辑kvcache，方便实现调用。
 
-![image.png](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/9e3fb595aee645f884026f98a2ef4b24~tplv-k3u1fbpfcp-watermark.image?)
+![](https://i-blog.csdnimg.cn/direct/a6285bf00e8945c580a77582f936ef69.png)
 
-![image.png](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/878750e8aa7d4b60a9e1eb65e20a5b54~tplv-k3u1fbpfcp-watermark.image?)
-
-
+![](https://i-blog.csdnimg.cn/direct/d9c5f4ccb6394825acc9bc3184c36fee.png)
 
 ​	`allocate_prefill()`主要的作用是为大模型prefill推理阶段分配KVcache资源，首先的话，由于之前已经说明，在Transformer 模型中，每层都有自己独立的 KV 缓存。因此，对于一个序列，我们需要为每一层分配一个块来存储该层的 KV 值。这就是为什么需要分配`num_layers`个块的原因，接下来的话则是开始分配，具体的实现，是通过对本地维护的四个表进行更新，后续通过以此判断来调用kvcahce，`free_blocks`和`allocated_blocks` 的更新很容易理解，重点是后面两个表的更新，`block_tables`首先这个表的数据结构为`Dict[int, List[Tuple[int, int]]]`  是一个哈希表，key为请求序列id，value是一个存储着二元元组list的数据结构，主要存储的作用是分配的block块和有效长度，  `self.block_tables[seq_id] = [(block, min(seq_len, self.block_size)) for block in allocated]` 这个代码，遍历了所有分配的 allocatedd的block,然后通过`min(seq_len, self.block_size)` ，为每一个block进行有效长度的赋值，为什么使用的min()的原因是
 
@@ -294,12 +294,16 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ​	这样的话可以很好的 **避免越界访问**，内存块按固定大小分配，但序列长度不一致。同时不会读取 / 写入超过块大小的位置（防止内存越界）。不会遗漏序列的任何 token（最后一个块可能不满，但仍会记录实际长度）。
 
-​	同时下一个 `paged_attention_block_tables` ，首先其的数据结构为 `Dict[int, List[List[int]]]`同样是哈希表，但是这个是一个三层结构，依旧是用序列Id作为key，但是value代表的是 最外层代表序列id的所有层所分配的block,而里面的list代表的是每一层所分配的block,`max_blocks_per_seq`定义了**每个层最多可以使用的块数量**。这是为了处理长序列的情况：当序列长度超过一个块的大小时，需要多个块来存储该层的 KV 缓存。每个张量`[[block] + [-1] * (self.max_blocks_per_seq - 1)]`表示一个层的块列表。初始时，每个层只分配一个块，因此列表中只有第一个位置有有效的块 ID，其余位置用`-1`填充。
+​	同时下一个 `paged_attention_block_tables` ，首先其的数据结构为 `Dict[int, List[List[int]]]`同样是哈希表，但是这个是一个三层结构，依旧是用序列Id作为key，但是value代表的是 最外层代表序列id的所有层所分配的block,而里面的list代表的是每一层所分配的block,按我是这么理解的，但实际上在赋值的代码中，实际的类型应该是`Dict[int, List[torch.Tensor]]` 这就不是很清楚作者的意图了。
 
-​	**这种设计的好处是当序列需要更多块时，可以动态更新这个列表，替换`-1`为新分配的块 ID**。
+​	但总体表示的就是每一层所分配的物理块列表。然后的话`max_blocks_per_seq`定义了**每个层最多可以使用的块数量**。这是为了处理长序列的情况：当序列长度超过一个块的大小时，需要多个块来存储该层的 KV 缓存。`[[block] + [-1] * (self.max_blocks_per_seq - 1)]`表示一个层的块列表。初始时，每个层只分配一个块，因此列表中只有第一个位置有有效的块 ID，其余位置用`-1`填充。
+
+​	接下来的话，就是slot_mappings了，这个的作用的本质上就是实现了分页注意力机制中逻辑位置到物理位置的映射，**遍历每个分配的物理块** (`for block in allocated`)，然后**生成逻辑位置索引** (`torch.arange(seq_len)`)：创建从 0 到`seq_len-1`的连续整数，表示 token 在序列中的逻辑位置，然后就是**计算物理块偏移量** (`block * self.block_size`)，通过确定当前物理块在全局 KV 缓存中的起始位置，最后进行**映射逻辑位置到物理位置**,将逻辑索引加上块偏移量，类似计算机组成原理里面的offset从而得到每个 token 在物理 KV 缓存中的实际位置。通过这样就可以使得逻辑地址到物理位置的映射。
+
+​	python的语法有时候我觉得太自由了，语法糖挺多的，另外一个麻烦的点，因为是解释型和动态类型的编程语言，有时候的返回值和变量在运行的时候才知道类型（any类型），读项目源码和debug有时候还挺头疼的。
 
 ```python
- def allocate_for_prefill(self, seq_id: int, num_layers: int, seq_len: int) -> Tuple[List[int], List[torch.Tensor], List[List[int]]]:
+def allocate_for_prefill(self, seq_id: int, num_layers: int, seq_len: int) -> Tuple[List[int], List[torch.Tensor], List[List[int]]]:
         """
         为预填充阶段（prefill）分配KV缓存块
         预填充阶段是对输入序列的首次处理（如用户输入的prompt），需要为每个Transformer层分配初始块，
@@ -312,15 +316,8 @@ def add_sequence(self, input_ids: torch.Tensor):
         
         返回：
             分配的块ID列表、槽映射（token到缓存位置的映射）、分页注意力块表
-        """
-        # 检查是否有足够的空闲块（至少需要与层数相同的块数）
-        if len(self.free_blocks) < num_layers:
-            raise RuntimeError("预填充分配时没有足够的空闲块")
-
-        # 从空闲块中分配num_layers个块（取前num_layers个）
-        allocated = self.free_blocks[:num_layers]
-        self.free_blocks = self.free_blocks[num_layers:]  # 更新空闲块列表
-        self.allocated_blocks[seq_id] = allocated  # 记录序列分配的块
+        """  
+        
         
         # 初始化块表：每个块的已填充数量为min(序列长度, 块大小)（块可能装不下整个序列）
         self.block_tables[seq_id] = [(block, min(seq_len, self.block_size)) for block in allocated]
@@ -339,5 +336,46 @@ def add_sequence(self, input_ids: torch.Tensor):
         ]
 
         return allocated, slot_mappings, self.paged_attention_block_tables[seq_id]
+    
+```
+
+​	`allocate_for_prefill`的作用为在prefill阶段请求序列初次分配kvcache资源,而`append_block`的作用则是在decode阶段在prefill分配的资源不过的时候，动态的添加kvcache资源，首先的话，查看是否有空闲块，获取空闲块号，然后更新块表以及填充token数量为0，这里有个注意的点，为什么为0，而prefill阶段为 `min(seq_len, self.block_size)`，`block_tables` 中每个元组 `(block_id, filled)` 的含义是：`block_id`：物理块的 ID，`filled`：该物理块中**已实际存储的 token 数量**（用于后续判断块是否已满，以及限制访问范围)。
+
+- 在预填充阶段，我们的目标是**为输入序列的首次处理分配块，并立即填充该序列的 KV 缓存**。此时块中已经有实际数据，`filled` 需要记录 “这个块到底装了多少个 token”。
+- 在动态扩展阶段，我们的目标是**新增一个空块，准备接收后续生成的 token**（比如解码阶段生成新 token 时，原块已满，需要新块存储）。此时新块刚分配，**还没有存储任何数据**，因此 `filled` 初始值为 `0`。
+
+​	接下来更新`paged_attention_block_tables`,其实无非就是判断那一层的缺失block，找到值为-1的索引，然后对其值赋值为之前得到空闲的快号。
+
+```python
+def append_block(self, seq_id: int, layer_idx: int) -> int:
+        """
+        在解码阶段为序列分配新的块（当现有块已满时）
+        
+        参数：
+            seq_id: 序列ID
+            layer_idx: 需要分配新块的Transformer层索引
+        
+        返回：
+            新分配的块ID
+        """
+        # 检查是否有空闲块
+        if len(self.free_blocks) == 0:
+            raise RuntimeError("没有可用的空闲块用于扩展")
+        
+        # 从空闲块中取一个新块
+        new_block = self.free_blocks.pop(0)
+        self.allocated_blocks[seq_id].append(new_block)  # 更新序列的已分配块列表
+        
+        # 更新块表：新增（新块ID, 0）（初始已填充数量为0）
+        self.block_tables[seq_id].append((new_block, 0))
+        # 找到分页注意力块表中该层的第一个未使用位置（-1），填入新块ID
+        new_block_index = 0
+        for i in range(self.max_blocks_per_seq):
+            if self.paged_attention_block_tables[seq_id][layer_idx][0][i] == -1:
+                new_block_index = i
+                break
+        self.paged_attention_block_tables[seq_id][layer_idx][0][new_block_index] = new_block
+
+        return new_block
 ```
 

@@ -82,6 +82,7 @@ class KVCache:
         ]
 
         # 计算槽映射（slot mappings）：每个token在缓存中的位置（块ID * 块大小 + token在块内的偏移）
+        #逻辑位置到物理位置的映射
         slot_mappings = [
             torch.arange(seq_len, dtype=torch.long, device='cuda') + block * self.block_size 
             for block in allocated
