@@ -277,7 +277,7 @@ def add_sequence(self, input_ids: torch.Tensor):
 - 预分配，但尚为用到。如分配了最大的token为500，但实际推理的也刚好满足500token，但是当推理到前10个token，后面还有许多token没有用到，刚刚好已经没有对应的显存了，但同时后面的请求只需要生成几十个token就可完成任务，这时候会导致后续的任务无法继续运行。
 - 这样的分配的制度，可能会导致许多的显存碎片，这些碎片无法满足后续的请求，导致资源浪费。
 
-​	这些问题是不是有些熟悉，在操作系统中，我们学习的内存分配的时候，也有一些类似的问题，当时是通过引入逻辑地址和页管理机制来实现对进程内存的分配，page_attention 就是类似于操作系统的页表机制，引入page_attention来帮助解决序列分配现存的问题。
+​	这些问题有些熟悉，在操作系统中，在我学习操作系统内存分配的时候，操作系统也解决过类似的问题，当时是通过引入逻辑地址和页管理机制来实现对进程内存的分配，page_attention 就是类似于操作系统的页表机制，引入page_attention来帮助解决序列分配现存的问题。
 
 ​	首先，page_attention 会把显存划分为以block单位，每个block可以存储若干个token，然后，类似于操作系统中页表机制以及虚拟内存，对于每一个请求，有逻辑kvcache和 物理显存kvcache，其中请求逻辑kvcache是连续的，而实际的存放token的物理显存kvcache可以不连续，每一个请求都有维护一个映射表来 映射逻辑kvcache和物理kvcache。从而达到对显存的高效分配，
 
@@ -377,5 +377,88 @@ def append_block(self, seq_id: int, layer_idx: int) -> int:
         self.paged_attention_block_tables[seq_id][layer_idx][0][new_block_index] = new_block
 
         return new_block
+```
+
+### block_manager
+
+​	block_manager顾名思义，其实就是块管理器，管理kvcache资源的申请，在服务启动的时候，会进行初始化，然后在服务的整个生命周期中一直存在运行，会在初始化的时候传入参数，然后在本地初始化注册KVcache组件，同时会在本地维护一个cpu缓存，分摊gpu显存压力。
+
+​	首先的一个函数就是 `allocate_for_prefill()`，主要负责prefill阶段的资源申请，其实本质就是调用的KVcache组件的 `allocate_for_prefill()`的函数，而KVcache组件的函数代码和特性我已经在前面详细解释了，主要外面套了一层block_manager的函数调用，这样的设计还挺常见的，区分了组件资源申请和实际资源分配的职责，起到解耦和方便后续扩展的作用。
+
+```python
+ def allocate_for_prefill(self, seq_id: int, num_layers: int, seq_len: int) -> Tuple[int, List[int], List[torch.Tensor], List[List[int]]]:
+
+        # 调用KV缓存的预填充分配方法
+        allocated, slot_mappings, paged_attention_block_table = self.kv_cache.allocate_for_prefill(seq_id, num_layers, seq_len)
+        return seq_id, allocated, slot_mappings, paged_attention_block_table
+```
+
+ 	下一个block_manager组件的主要函数则是`decode_step()`，负责decode阶段的kvcache资源的申请，相比于前一个`allocate_for_prefill()` 代码逻辑相对于复杂一些，首先在大模型生成文本时，解码阶段是 逐 token 生成”的（每次生成 1 个新 token）。该函数的作用是为每个新 token 在 KV 缓存中分配存储位置，若当前块已满则自动扩展新块，并更新缓存管理的块表、槽映射，确保新 token 的 KV 值能被正确存储和引用。
+
+​	首先，根据请求序列id,获取本地kvcache 所维护的`block_table`和  `paged_attention_block_table`，因为`block_table` 存储着序列id已经分配block的token 填充情况，以此判断是否需要新增block, 而`paged_attention_block_table` 记录着序列id每一层所分配block的占用情况，可以以此判断block的分配是否满额。
+
+​	接下来需要为新token分配存储位置，首先需要遍历`paged_attention_block_table`，得到每一层的分配block的情况，然后再通过内层循环遍历`layer_blocks`找到最后一个有效块, 因为需要通过这个得到最后一个block的编号,代码的实现的逻辑是通过对`layer_blocks`遍历，得到值为-1为的索引，然后倒推索引前面则为最后一个block的编号。
+
+​	**但是这里代码好像有些隐藏的bug**,根据这个处理逻辑判断的话，如果`layer_blocks` 已经分配最大数量的block,那根本就不会出现值为分配编号值为-1的索引，那默认的话，则以最后一个last_block为-1，那按后续的代码处理， `last_block_info` 会一直为None，后续大概率出现空指针异常，当然python应该是引用，出现的应该是AttributeError，解决的话，需要额外代码处理 block分配达到最大值的情况，但好像项目并没有相关代码处理。
+
+​	找到最后一个block编号以后，通过`block_table` 判断填充情况，如果已满则需通过调用kvcache的`append_block`函数添加新的block再进行token分配，然后计算token 存储的逻辑地址，添加到`new_slot_mapping`，然后对KVCache维护的相关表进行更新，然后进行返回。
+
+```python
+def decode_step(self, seq_id: int, input_len: int) -> Tuple[List[List[int]], torch.Tensor]:
+        """
+        解码步骤（生成下一个token时）的缓存管理
+        
+        解码阶段是逐token生成的过程，需要为新生成的token分配缓存空间，
+        若当前块已满则分配新块，并更新块表和映射关系。
+        
+        参数：
+            seq_id: 序列ID
+            input_len: 本次输入的token长度（通常为1，因为逐token生成）
+        
+        返回：
+            更新后的分页注意力块表、新的槽映射（新token的缓存位置）
+        """
+        # 获取当前序列的块表和分页注意力块表
+        block_table = self.kv_cache.get_block_table(seq_id)
+        paged_attention_block_table = self.kv_cache.get_paged_attention_block_table(seq_id)
+
+        new_slot_mapping = []  # 新token的槽映射（缓存位置）
+        # 遍历每个Transformer层的块表
+        for layer_idx, layer_blocks in enumerate(paged_attention_block_table):
+            last_block = -1  # 记录当前层的最后一个有效块
+            # 查找最后一个填充的块（通过块表中的-1标记未使用位置）
+            for i in range(1, len(layer_blocks[0])):
+                if layer_blocks[0][i] == -1:
+                    last_block = layer_blocks[0][i-1]  # 最后一个有效块ID
+                    break
+            
+            # 查找最后一个块的详细信息（块ID和已填充数量）
+            last_block_info = None
+            for (block, filled) in block_table:
+                if block == last_block:
+                    last_block_info = (block, filled)
+                    break
+            
+            _, num_filled = last_block_info  # 最后一个块已填充的token数
+
+            # 若当前块已满（已填充数量达到块大小），则分配新块
+            if num_filled == self.block_size:
+                print("在BlockManager.decode_step中，块已填满，需要分配新块。")
+                # 为当前层分配新块并添加到序列的块表中
+                new_block = self.kv_cache.append_block(seq_id, layer_idx)
+                last_block = new_block  # 更新最后一个块为新分配的块
+                num_filled = 0  # 新块初始填充数量为0
+
+            # 计算新token在缓存中的位置（块ID * 块大小 + 填充位置）
+            new_slot = last_block * self.block_size + num_filled
+            new_slot_mapping.append(torch.tensor([new_slot], dtype=torch.long, device="cuda"))
+            
+            # 更新块表中最后一个块的填充数量（+输入长度，通常为1）
+            self.kv_cache.update_block_table(seq_id, last_block, num_filled + input_len)
+
+        # 获取更新后的分页注意力块表/
+        paged_attention_block_table = self.kv_cache.get_paged_attention_block_table(seq_id)        
+
+        return paged_attention_block_table, new_slot_mapping
 ```
 

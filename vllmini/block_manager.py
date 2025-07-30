@@ -11,7 +11,6 @@ class BlockManager:
     def __init__(self, num_blocks: int, block_size: int, num_heads: int, head_size: int, max_blocks_per_seq:int):
         """
         初始化块管理器
-        
         参数：
             num_blocks: 总缓存块数量（全局可用的块数）
             block_size: 每个块可存储的token数量（块大小）
@@ -60,7 +59,8 @@ class BlockManager:
         块表是每个序列占用的缓存块的元数据，包含（块ID，已填充token数）的列表。
         
         参数：
-            seq_id: 序列ID
+            seq_id: 
+            .序列ID
         
         返回：
             块表列表，每个元素为（块ID，该块已填充的token数）
