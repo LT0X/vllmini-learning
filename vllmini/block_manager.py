@@ -23,6 +23,8 @@ class BlockManager:
         self.num_heads = num_heads    # 注意力头数
         self.head_size = head_size    # 每个头的维度
 
+        self.max_blocks_per_seq = max_blocks_per_seq  # 新增这一行
+
         # 初始化GPU上的KV缓存（核心缓存，用于实时计算）
         self.kv_cache = KVCache(
             num_blocks=num_blocks,

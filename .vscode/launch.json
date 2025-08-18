@@ -1,0 +1,26 @@
+{
+     // Use IntelliSense to learn about possible attributes.
+     // Hover to view descriptions of existing attributes.
+     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+     // ctrl+f5
+     "version": "0.2.0",
+     "configurations": [
+          
+           {
+            "name": "debugpy: 模块方式运行",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vllmini.main",  // 指定模块名（不带.py后缀）
+            "console": "integratedTerminal",
+            
+          },
+          
+          {
+               "name": "Python run",
+               "type": "python",
+               "request": "launch",
+               "module": "vllmini.main",
+               "console": "integratedTerminal"
+          }
+     ]
+}

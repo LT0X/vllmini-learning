@@ -4,7 +4,7 @@ from transformers import GPT2Config
 from typing import List, Optional, Tuple
 from paged_attention_cuda import paged_attention_v1, cache_ops
 
-class GPT2Attention(nn.Module):
+class GPT2Attention(nn.Module): 
     def __init__(self, config: GPT2Config):
         super().__init__()
         self.hidden_size = config.hidden_size

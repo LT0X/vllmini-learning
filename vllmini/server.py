@@ -3,12 +3,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel  # 用于请求和响应的数据验证
 from transformers import GPT2Config, GPT2Tokenizer  # GPT2的配置和分词器
+from transformers import AutoTokenizer
 import torch
 
 # 导入自定义的调度器、块管理器和GPT2模型实现
 from vllmini.scheduler import Scheduler
 from vllmini.block_manager import BlockManager
 from vllmini.model.gpt2 import GPT2LMHeadModel
+from vllmini.speculative_decoding import LLMSpeculativeDecoding
+from vllmini.model.qwen_v1 import QwenLMHeadModel
 
 
 # 定义请求数据模型：接收用户输入的提示词和最大生成长度
@@ -31,8 +34,47 @@ class ResultResponse(BaseModel):
 # 全局变量：将在服务启动时初始化
 scheduler = None  # 调度器实例，管理所有生成任务
 tokenizer = None  # GPT2分词器，用于文本与token的转换
+qwen_tokenizer = None #Qwen分词器，用于文本与token的转换
 device = "cuda" if torch.cuda.is_available() else "cpu"  # 计算设备（优先使用GPU）
 
+
+#对于初始化投机解码组件封装函数，尽可能避免在原组件直接添加代码
+def init_LLMSpeculativeDecoding()->LLMSpeculativeDecoding:
+    
+    global qwen_tokenizer
+    main_model_path = "/home/xtc/.cache/modelscope/hub/models/Qwen/Qwen-7B-Chat-Int4"
+    draft_model_path = "/home/xtc/.cache/modelscope/hub/models/Qwen/Qwen-1_8B-Chat-Int4"
+    
+    main_model = QwenLMHeadModel.from_pretrained(main_model_path)
+    draft_model = QwenLMHeadModel.from_pretrained(draft_model_path)
+    
+    qwen_tokenizer = AutoTokenizer.from_pretrained(main_model_path)
+
+    main_block_manager = BlockManager(
+        num_blocks=1000,
+        block_size=16,
+        num_heads=config.num_attention_heads,
+        head_size=config.hidden_size // config.num_attention_heads,
+        max_blocks_per_seq=4
+    )
+
+    draft_block_manager = BlockManager(
+        num_blocks=1000,
+        block_size=16,
+        num_heads=config.num_attention_heads,
+        head_size=config.hidden_size // config.num_attention_heads,
+        max_blocks_per_seq=4
+    )
+
+    return LLMSpeculativeDecoding(
+        main_model= main_model,
+        draft_model= draft_model,
+        main_block_manager= main_block_manager,
+        draft_block_manager= draft_block_manager,
+        tokenizer=tokenizer,
+        max_speculative_steps=3,
+        eos_token_id=50256
+    )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,6 +83,10 @@ async def lifespan(app: FastAPI):
     """
     # 服务启动时执行
     global scheduler, tokenizer, device
+
+    #初始化投机解码组件（all）
+    speculative_decoding = init_LLMSpeculativeDecoding()
+    
     
     # 初始化组件
     config = GPT2Config.from_pretrained("gpt2")  # 加载GPT2的配置
@@ -61,6 +107,7 @@ async def lifespan(app: FastAPI):
         head_size=head_size,
         max_blocks_per_seq=max_blocks_per_seq
     )
+
     
     # 初始化GPT2模型并加载预训练权重
     model = GPT2LMHeadModel(config)
@@ -71,6 +118,7 @@ async def lifespan(app: FastAPI):
     scheduler = Scheduler(
         model=model,
         block_manager=block_manager,
+        speculative_decoding=speculative_decoding,
         max_length=20  # 序列的最大生成长度（可根据需求调整）
     )
     
@@ -151,6 +199,55 @@ async def get_result(seq_id: int):
     # 若序列ID不存在，返回错误状态
     return ResultResponse(status="error")
 
+@app.post("/generatePro", response_model=GenerationResponse)
+async def generate(request: GenerationRequest):
+    """
+    投机解码版本：将用户输入的提示词转为生成任务并返回序列ID
+    """
+    # 声明全局变量，以便在函数内部使用
+    global scheduler, qwen_tokenizer, device
+    
+    # 检查调度器是否已初始化（未初始化则返回服务不可用）
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="调度器尚未初始化")
+
+    # 将用户输入的提示词编码为token ID（模型可处理的数字形式）
+    tokens = qwen_tokenizer.encode(request.prompt)
+    input_ids = torch.tensor([tokens], dtype=torch.int64, device=device)  # 转换为张量并移动到指定设备
+
+    # 将输入添加到调度器，获取任务唯一ID
+    seq_id = scheduler.add_sequence_pro(input_ids)
+
+    # 返回生成任务的ID（用于后续查询结果）
+    return GenerationResponse(sequence_id=seq_id)
+
+@app.get("/resultPro/{seq_id}", response_model=ResultResponse)
+async def get_result(seq_id: int):
+    """
+    查询生成结果的API端点：根据序列ID返回当前生成状态和结果
+    """
+    global scheduler, tokenizer
+    
+    # 检查调度器是否已初始化
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="调度器尚未初始化")
+
+    # 检查序列ID是否存在于生成任务中
+    if seq_id in scheduler.sequences:
+        # 获取生成的token ID序列并解码为文本
+        generated_ids = scheduler.sequences[seq_id]
+        generated_tokens = tokenizer.decode(generated_ids[0].tolist())
+
+        # 判断任务状态：活跃（处理中）或已完成
+        if seq_id in scheduler.active_sequences:
+            return ResultResponse(status="in progress", generated=generated_tokens)
+        
+        # 任务完成后，移除已完成的序列数据并返回结果
+        scheduler.remove_completed_sequence(seq_id)
+        return ResultResponse(status="completed", generated=generated_tokens)
+
+    # 若序列ID不存在，返回错误状态
+    return ResultResponse(status="error")
                                                                              
 # 当脚本直接运行时，启动UVicorn服务器
 if __name__ == "__main__":
