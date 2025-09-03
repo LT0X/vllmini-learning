@@ -294,7 +294,7 @@ def add_sequence(self, input_ids: torch.Tensor):
 
 ​	这样的话可以很好的 **避免越界访问**，内存块按固定大小分配，但序列长度不一致。同时不会读取 / 写入超过块大小的位置（防止内存越界）。不会遗漏序列的任何 token（最后一个块可能不满，但仍会记录实际长度）。
 
-​	同时下一个 `paged_attention_block_tables` ，首先其的数据结构为 `Dict[int, List[List[int]]]`同样是哈希表，但是这个是一个三层结构，依旧是用序列Id作为key，但是value代表的是 最外层代表序列id的所有层所分配的block,而里面的list代表的是每一层所分配的block,按我是这么理解的，但实际上在赋值的代码中，实际的类型应该是`Dict[int, List[torch.Tensor]]` 这就不是很清楚作者的意图了。
+​	同时下一个 `paged_attention_block_tables` ，首先其的数据结构为 `Dict[int, List[List[int]]]`同样是哈希表，但是这个是一个三层结构，依旧是用序列Id作为key，但是value代表的是 最外层代表序列id的所有层所分配的block,而里面的list代表的是每一层所分配的block,按我是这么理解的，但实际上在赋值的代码中，虽然实际的类型应该是`Dict[int, List[torch.Tensor]]` ，但是赋值语句里面里的`torch.tensor`第一个参数以[]列表构建的，所以实际的逻辑等价于`Dict[int, List[List[int]]]`，这可能作者是这样写的用意。
 
 ​	但总体表示的就是每一层所分配的物理块列表。然后的话`max_blocks_per_seq`定义了**每个层最多可以使用的块数量**。这是为了处理长序列的情况：当序列长度超过一个块的大小时，需要多个块来存储该层的 KV 缓存。`[[block] + [-1] * (self.max_blocks_per_seq - 1)]`表示一个层的块列表。初始时，每个层只分配一个块，因此列表中只有第一个位置有有效的块 ID，其余位置用`-1`填充。
 
@@ -393,13 +393,15 @@ def append_block(self, seq_id: int, layer_idx: int) -> int:
         return seq_id, allocated, slot_mappings, paged_attention_block_table
 ```
 
- 	下一个block_manager组件的主要函数则是`decode_step()`，负责decode阶段的kvcache资源的申请，相比于前一个`allocate_for_prefill()` 代码逻辑相对于复杂一些，首先在大模型生成文本时，解码阶段是 逐 token 生成”的（每次生成 1 个新 token）。该函数的作用是为每个新 token 在 KV 缓存中分配存储位置，若当前块已满则自动扩展新块，并更新缓存管理的块表、槽映射，确保新 token 的 KV 值能被正确存储和引用。
+ 	
+
+​	下一个block_manager组件的主要函数则是`decode_step()`，负责decode阶段的kvcache资源的申请，相比于前一个`allocate_for_prefill()` 代码逻辑相对于复杂一些，首先在大模型生成文本时，解码阶段是 逐 token 生成”的（每次生成 1 个新 token）。该函数的作用是为每个新 token 在 KV 缓存中分配存储位置，若当前块已满则自动扩展新块，并更新缓存管理的块表、槽映射，确保新 token 的 KV 值能被正确存储和引用。
 
 ​	首先，根据请求序列id,获取本地kvcache 所维护的`block_table`和  `paged_attention_block_table`，因为`block_table` 存储着序列id已经分配block的token 填充情况，以此判断是否需要新增block, 而`paged_attention_block_table` 记录着序列id每一层所分配block的占用情况，可以以此判断block的分配是否满额。
 
 ​	接下来需要为新token分配存储位置，首先需要遍历`paged_attention_block_table`，得到每一层的分配block的情况，然后再通过内层循环遍历`layer_blocks`找到最后一个有效块, 因为需要通过这个得到最后一个block的编号,代码的实现的逻辑是通过对`layer_blocks`遍历，得到值为-1为的索引，然后倒推索引前面则为最后一个block的编号。
 
-​	**但是这里代码好像有些隐藏的bug**,根据这个处理逻辑判断的话，如果`layer_blocks` 已经分配最大数量的block,那根本就不会出现值为分配编号值为-1的索引，那默认的话，则以最后一个last_block为-1，那按后续的代码处理， `last_block_info` 会一直为None，后续大概率出现空指针异常，当然python应该是引用，出现的应该是AttributeError，解决的话，需要额外代码处理 block分配达到最大值的情况，但好像项目并没有相关代码处理。
+​	**但是发现这里代码好像有些隐藏的bug**,根据这个处理逻辑判断的话，如果`layer_blocks` 已经分配最大数量的block,那根本就不会出现值为分配编号值为-1的索引，那默认的话，则以最后一个last_block为-1，那按后续的代码处理， `last_block_info` 会一直为None，后续大概率出现空指针异常，当然python应该是引用，出现的应该是AttributeError，解决的话，需要额外代码处理 block分配达到最大值的情况，但好像项目并没有相关代码处理。
 
 ​	找到最后一个block编号以后，通过`block_table` 判断填充情况，如果已满则需通过调用kvcache的`append_block`函数添加新的block再进行token分配，然后计算token 存储的逻辑地址，添加到`new_slot_mapping`，然后对KVCache维护的相关表进行更新，然后进行返回。
 
@@ -462,3 +464,42 @@ def decode_step(self, seq_id: int, input_len: int) -> Tuple[List[List[int]], tor
         return paged_attention_block_table, new_slot_mapping
 ```
 
+### 投机解码
+
+​	投机解码是一种加速大语言模型llm推理的方法，利用一个高效的近似模型生成候选 token，然后通过目标模型验证这些候选 token 的合理性，从而减少目标模型的序列调用次数。
+
+​	投机解码的核心动机是：在生成任务中，总有简单和复杂的子任务，对于一些较为简单的任务，解码过程存在可以节约资源的环节，使用大模型进行每轮一个token的自回归解码存在资源上的浪费；换句话说，简单的子任务只需要用参数量较小的模型来生成也能取得与使用大模型生成相当的效果，亦或是用大模型在每轮迭代进行多个token的并行解码也依然能保持生成质量。基于此，投机解码采用一种draft-then-verify的机制来实现这一过程。
+
+​	这种技术可以在某些较简单的任务可以起到很好的加速效果，不同于**flash_attention** 这种通过对Q,K,V矩阵的拆分到小矩阵，通过尽可能在SRAM高速缓存在进行计算，而无需在写入HBM中，减少IO主要的开销，达到主要对推理prefill阶段的优化。而**page_attention**则是通过高效的显存管理方式来减少相应的显存碎片和分配问题以此来提高运行的效率。而投机解码不同以上主要在显存方面的优化，投机解码主要优化的点是通过主模型和草稿模型的配合，主要在decode阶段起到相应的推理加速的效果，同时也可以与之前相关优化技术结合一起使用。
+
+​	其实，实际上投机解码的主要的加速原理还是比较好理解，对于常规的**自回归大模型**，常常都是接受对应的输入的信息，然后模型进行preill阶段并行预处理，紧接着decode自回归一个一个生成对应的token，这个时候生成内容的质量往往与模型的参数的大小有很大的关系，意思就是往往我们需要高质量的生成内容的时候，负责推理的模型对应的参数也会随之增加，同样，我们在更大参数的模型进行着**推理任务**所花费的时间也会更长，所以就有**投机解码**的这一种的处理方式。
+
+​	主要是在我们的推理任务中，不止有一个模型参与任务，分为了主模型和草稿模型，其中主模型往往拥有着更多的参数，草稿模型往往是主模型的“低配版”，拥有的参数并没有主模型那么多，那我们在推理的时候，就可以优先又草稿模型进行生成对应的草稿token，紧接着交与主模型进行对草稿token进行verify验证操作，由主模型对草稿token决定是否要接受，同时主模型在验证阶段是可以并行对token进行验证，进而提升推理速度。如果草稿模型接受率高的话，那我们只需要付出草稿模型低成本的推理时间而获得主模型高质量的文本内容，当然这一切的前提是接受率高的前提下，如果接受率低的话，模型则需要进行相应的回退操作以及kvcache回退，这个是比较耗时和麻烦（至少我实现的时候并不简单，要考虑的东西步骤挺多的），以及草稿模型的重新推理，这样可能使得由草稿模型所节省的时间以另外一种形式花费到其他步骤去了，最后可能还要更耗时间。所以主要的问题则是提高主模型对草稿模型的接受率，所以在对主模型和草稿模型选取中，往往选择同一系列的模型不同参数的模型，如qwen系列或者gpt系列，同一系列往往天然 **“对齐”**，它们共享相同的词汇表，但具有不同的参数量,模型结构往往差距不大，同时它们一般在相同的数据上训练，这样可以保证主模型和草稿模型在生成任务上的结果近似。从而提高主模型对草稿token的接受率。
+
+![https://i-blog.csdnimg.cn/direct/2eeed3b1061c4036822733c5edc0d8d9.png](https://i-blog.csdnimg.cn/direct/2eeed3b1061c4036822733c5edc0d8d9.png)
+
+### speculative_decoding
+
+​	speculative_decoding是本次需要在原来的项目的基础上添加的一个组件，主要是负责项目中推理的时候的投机解码，因为是基于原来项目添加对应的相应的代码，所以理所当然的，组件需要适配项目的技术特性，如本项目的相关组件，schedule，block_manager，kv_cache，以及page_attention，所以在原有的项目更新和添加组件需要处理一下兼容性的问题，同时项目的模型结构，模型参数，以及分词器tokenizer等主要运用的是GPT2模型，这次要用到主模型和草稿模型主要使用的是Qwen系列，原项目因为各方面的技术特性都是自己coding 的，所以为了兼容自己所写的特性，原项目也是创建了gpt2自己实现了模型核心结构，也就是说，要添加组件并进行特性兼容的情况的下，我也得自己实现对应的主模型和草稿模型的核心的结构，同时还得进行兼容的设计，这一点我感觉是最难的点，虽然最后实现了个基本情况，且把投机解码逻辑处理代码完成书写，但因个人可能关于大模型这方面关掌握可能还不是很熟练，项目在decode阶段生成的文本内容总是不理想，且有一些bug还未完成修复，这些问题困惑很久还是未能解决，遂决定先书写完文档再继续解决，后解决后会同步更新对应文档。
+
+### 项目投机解码架构图![点击并拖拽以移动](data:image/gif;base64,R0lGODlhAQABAPABAP///wAAACH5BAEKAAAALAAAAAABAAEAAAICRAEAOw==)
+
+![img](https://i-blog.csdnimg.cn/direct/5304d512c8cb46b2ae728b6c1ed3e085.png)
+
+今天先更新到这里， 明天继续更新代码部分。
+
+
+
+
+
+
+
+目前的一些相关效果
+
+![点击并拖拽以移动](data:image/gif;base64,R0lGODlhAQABAPABAP///wAAACH5BAEKAAAALAAAAAABAAEAAAICRAEAOw==)![img](https://i-blog.csdnimg.cn/direct/6fc228587cd9494a90831ec9319e8d0b.png)
+
+​	![](https://i-blog.csdnimg.cn/direct/e224a46a6a2f436fa7ee58fe7372fe94.png)![点击并拖拽以移动](data:image/gif;base64,R0lGODlhAQABAPABAP///wAAACH5BAEKAAAALAAAAAABAAEAAAICRAEAOw==)![img](https://i-blog.csdnimg.cn/direct/25a1795bb63a4762ba8e3c35f80cb0d9.png)
+
+![点击并拖拽以移动](data:image/gif;base64,R0lGODlhAQABAPABAP///wAAACH5BAEKAAAALAAAAAABAAEAAAICRAEAOw==)
+
+![img](https://i-blog.csdnimg.cn/direct/b26ddc0f5ff9465e826e6d08810229e7.png)
