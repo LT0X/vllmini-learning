@@ -482,7 +482,9 @@ def decode_step(self, seq_id: int, input_len: int) -> Tuple[List[List[int]], tor
 
 ​	speculative_decoding是本次需要在原来的项目的基础上添加的一个组件，主要是负责项目中推理的时候的投机解码，因为是基于原来项目添加对应的相应的代码，所以理所当然的，组件需要适配项目的技术特性，如本项目的相关组件，schedule，block_manager，kv_cache，以及page_attention，所以在原有的项目更新和添加组件需要处理一下兼容性的问题，同时项目的模型结构，模型参数，以及分词器tokenizer等主要运用的是GPT2模型，这次要用到主模型和草稿模型主要使用的是Qwen系列，原项目因为各方面的技术特性都是自己coding 的，所以为了兼容自己所写的特性，原项目也是创建了gpt2自己实现了模型核心结构，也就是说，要添加组件并进行特性兼容的情况的下，我也得自己实现对应的主模型和草稿模型的核心的结构，同时还得进行兼容的设计，这一点我感觉是最难的点，虽然最后实现了个基本情况，且把投机解码逻辑处理代码完成书写，但因个人可能关于大模型这方面关掌握可能还不是很熟练，项目在decode阶段生成的文本内容总是不理想，且有一些bug还未完成修复，这些问题困惑很久还是未能解决，遂决定先书写完文档再继续解决，后解决后会同步更新对应文档。
 
-### 项目投机解码架构图![点击并拖拽以移动](data:image/gif;base64,R0lGODlhAQABAPABAP///wAAACH5BAEKAAAALAAAAAABAAEAAAICRAEAOw==)
+### 项目投机解码架构图
+
+
 
 ![img](https://i-blog.csdnimg.cn/direct/5304d512c8cb46b2ae728b6c1ed3e085.png)
 
@@ -496,10 +498,16 @@ def decode_step(self, seq_id: int, input_len: int) -> Tuple[List[List[int]], tor
 
 目前的一些相关效果
 
-![点击并拖拽以移动](data:image/gif;base64,R0lGODlhAQABAPABAP///wAAACH5BAEKAAAALAAAAAABAAEAAAICRAEAOw==)![img](https://i-blog.csdnimg.cn/direct/6fc228587cd9494a90831ec9319e8d0b.png)
+![img](https://i-blog.csdnimg.cn/direct/6fc228587cd9494a90831ec9319e8d0b.png)
 
-​	![](https://i-blog.csdnimg.cn/direct/e224a46a6a2f436fa7ee58fe7372fe94.png)![点击并拖拽以移动](data:image/gif;base64,R0lGODlhAQABAPABAP///wAAACH5BAEKAAAALAAAAAABAAEAAAICRAEAOw==)![img](https://i-blog.csdnimg.cn/direct/25a1795bb63a4762ba8e3c35f80cb0d9.png)
 
-![点击并拖拽以移动](data:image/gif;base64,R0lGODlhAQABAPABAP///wAAACH5BAEKAAAALAAAAAABAAEAAAICRAEAOw==)
+
+![](https://i-blog.csdnimg.cn/direct/e224a46a6a2f436fa7ee58fe7372fe94.png)
+
+
+
+![img](https://i-blog.csdnimg.cn/direct/25a1795bb63a4762ba8e3c35f80cb0d9.png)
+
+
 
 ![img](https://i-blog.csdnimg.cn/direct/b26ddc0f5ff9465e826e6d08810229e7.png)
