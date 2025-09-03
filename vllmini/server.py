@@ -4,14 +4,18 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel  # 用于请求和响应的数据验证
 from transformers import GPT2Config, GPT2Tokenizer  # GPT2的配置和分词器
 from transformers import AutoTokenizer
+from transformers import AutoConfig,Qwen2Config,Qwen2Tokenizer
 import torch
+
 
 # 导入自定义的调度器、块管理器和GPT2模型实现
 from vllmini.scheduler import Scheduler
 from vllmini.block_manager import BlockManager
 from vllmini.model.gpt2 import GPT2LMHeadModel
 from vllmini.speculative_decoding import LLMSpeculativeDecoding
-from vllmini.model.qwen_v1 import QwenLMHeadModel
+# from vllmini.model.qwen_v1 import QwenLMHeadModel
+from vllmini.model.qwen2 import Qwen2LMHeadModel
+from vllmini.modle_type import IsSpdecode
 
 
 # 定义请求数据模型：接收用户输入的提示词和最大生成长度
@@ -39,42 +43,52 @@ device = "cuda" if torch.cuda.is_available() else "cpu"  # 计算设备（优先
 
 
 #对于初始化投机解码组件封装函数，尽可能避免在原组件直接添加代码
-def init_LLMSpeculativeDecoding()->LLMSpeculativeDecoding:
+def init_LLMSpeculativeDecoding(main_model_path: str,draft_model_path: str,
+                                main_config:Qwen2Config ,draft_config: Qwen2Config):
     
     global qwen_tokenizer
-    main_model_path = "/home/xtc/.cache/modelscope/hub/models/Qwen/Qwen-7B-Chat-Int4"
-    draft_model_path = "/home/xtc/.cache/modelscope/hub/models/Qwen/Qwen-1_8B-Chat-Int4"
     
-    main_model = QwenLMHeadModel.from_pretrained(main_model_path)
-    draft_model = QwenLMHeadModel.from_pretrained(draft_model_path)
+    num_blocks = 1000  # 总缓存块数量
+    block_size = 16    #一个block存储的token数量
+    max_blocks_per_seq =4 #每一层一个序列最多可使用的缓存块数量
+    max_speculative_steps = 1 #草稿预测的步数
+
+    main_model = Qwen2LMHeadModel(main_config)
+    draft_model = Qwen2LMHeadModel(draft_config)
+    main_model.load_huggingface_weights(main_model_path)
+    draft_model.load_huggingface_weights(draft_model_path)
+    main_model.to(device)
+    # draft_model.to("cpu")
     
-    qwen_tokenizer = AutoTokenizer.from_pretrained(main_model_path)
+    qwen_tokenizer = Qwen2Tokenizer.from_pretrained(main_model_path)
 
     main_block_manager = BlockManager(
-        num_blocks=1000,
-        block_size=16,
-        num_heads=config.num_attention_heads,
-        head_size=config.hidden_size // config.num_attention_heads,
-        max_blocks_per_seq=4
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_heads=main_config.num_attention_heads,
+        head_size=main_config.hidden_size // main_config.num_attention_heads,
+        max_blocks_per_seq=max_blocks_per_seq
     )
 
     draft_block_manager = BlockManager(
-        num_blocks=1000,
-        block_size=16,
-        num_heads=config.num_attention_heads,
-        head_size=config.hidden_size // config.num_attention_heads,
-        max_blocks_per_seq=4
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_heads=draft_config.num_attention_heads,
+        head_size=draft_config.hidden_size // draft_config.num_attention_heads,
+        max_blocks_per_seq=max_blocks_per_seq
     )
 
-    return LLMSpeculativeDecoding(
+    speculative_decoding  = LLMSpeculativeDecoding(
         main_model= main_model,
         draft_model= draft_model,
         main_block_manager= main_block_manager,
         draft_block_manager= draft_block_manager,
         tokenizer=tokenizer,
-        max_speculative_steps=3,
-        eos_token_id=50256
+        max_speculative_steps=max_speculative_steps,
+        eos_token_id=main_config.eos_token_id
     )
+
+    return main_model, draft_model,main_block_manager,draft_block_manager,speculative_decoding
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -84,43 +98,64 @@ async def lifespan(app: FastAPI):
     # 服务启动时执行
     global scheduler, tokenizer, device
 
-    #初始化投机解码组件（all）
-    speculative_decoding = init_LLMSpeculativeDecoding()
     
-    
-    # 初始化组件
-    config = GPT2Config.from_pretrained("gpt2")  # 加载GPT2的配置
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")  # 加载GPT2分词器
-    
-    # 配置KV缓存块管理器的参数
-    num_blocks = 1000  # 总缓存块数量
-    num_heads = config.num_attention_heads  # 注意力头数量（从模型配置获取）
-    head_size = config.hidden_size // num_heads  # 每个注意力头的维度
-    block_size = 16  # 每个缓存块的大小（可存储的token数量）
-    max_blocks_per_seq = 4  # 每个序列最多可使用的缓存块数量
-    
-    # 初始化块管理器（负责KV缓存的分配和释放）
-    block_manager = BlockManager(
-        num_blocks=num_blocks,
-        block_size=block_size,
-        num_heads=num_heads,
-        head_size=head_size,
-        max_blocks_per_seq=max_blocks_per_seq
-    )
+    if IsSpdecode:
+        #进行单模型工作加载
+        # 初始化组件
+        print("开始加载gpt2模型")
+        config = GPT2Config.from_pretrained("gpt2")  # 加载GPT2的配置
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")  # 加载GPT2分词器
+        
+        # 配置KV缓存块管理器的参数
+        num_blocks = 1000  # 总缓存块数量
+        num_heads = config.num_attention_heads  # 注意力头数量（从模型配置获取）
+        head_size = config.hidden_size // num_heads  # 每个注意力头的维度
+        block_size = 16  # 每个缓存块的大小（可存储的token数量）
+        max_blocks_per_seq = 4  # 每个序列最多可使用的缓存块数量
 
+        # 初始化块管理器（负责KV缓存的分配和释放）
+        block_manager = BlockManager(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_heads=num_heads,
+            head_size=head_size,
+            max_blocks_per_seq=max_blocks_per_seq
+        )
+
+         # 初始化GPT2模型并加载预训练权重
+        model = GPT2LMHeadModel(config)
+        model.load_huggingface_weights("gpt2")  # 加载HuggingFace格式的预训练权重
+        model = model.to(device).to(torch.float16)  # 移动到指定设备并使用半精度（节省内存）
+        
+        # 初始化调度器（管理生成任务队列和执行）
+        scheduler = Scheduler(
+            model=model,
+            block_manager=block_manager,
+            max_length=20  # 序列的最大生成长度（可根据需求调整）
+        )
+    else:
+        #进行投机解码模式初始化
+        print("开始加载Qwen模型")
+        main_model_path = "/home/xtc/.cache/modelscope/hub/models/Qwen/Qwen2___5-1___5B-Instruct"
+        draft_model_path = "/home/xtc/.cache/modelscope/hub/models/Qwen/Qwen2___5-0___5B-Instruct"
     
-    # 初始化GPT2模型并加载预训练权重
-    model = GPT2LMHeadModel(config)
-    model.load_huggingface_weights("gpt2")  # 加载HuggingFace格式的预训练权重
-    model = model.to(device).to(torch.float16)  # 移动到指定设备并使用半精度（节省内存）
-    
-    # 初始化调度器（管理生成任务队列和执行）
-    scheduler = Scheduler(
-        model=model,
-        block_manager=block_manager,
-        speculative_decoding=speculative_decoding,
-        max_length=20  # 序列的最大生成长度（可根据需求调整）
-    )
+        main_config = Qwen2Config.from_pretrained(main_model_path,local_files_only=True)
+        draft_config = Qwen2Config.from_pretrained(draft_model_path,local_files_only=True)
+        
+         #初始化投机解码组件（all）
+        main_model,draft_model,main_block_manager,draft_block_manager,speculative_decoding= init_LLMSpeculativeDecoding(main_model_path,draft_model_path,
+                                                           main_config,draft_config)
+        
+        scheduler = Scheduler( 
+            speculative_decoding=speculative_decoding,
+            model=None,
+            block_manager=None,
+            max_length=20,  # 序列的最大生成长度（可根据需求调整）
+            max_speculative_steps=speculative_decoding.max_speculative_steps
+        )
+        
+        
+   
     
     # 在后台任务中启动调度器
     scheduler_task = asyncio.create_task(run_scheduler())
@@ -207,6 +242,7 @@ async def generate(request: GenerationRequest):
     # 声明全局变量，以便在函数内部使用
     global scheduler, qwen_tokenizer, device
     
+    print("")
     # 检查调度器是否已初始化（未初始化则返回服务不可用）
     if scheduler is None:
         raise HTTPException(status_code=503, detail="调度器尚未初始化")
@@ -214,7 +250,7 @@ async def generate(request: GenerationRequest):
     # 将用户输入的提示词编码为token ID（模型可处理的数字形式）
     tokens = qwen_tokenizer.encode(request.prompt)
     input_ids = torch.tensor([tokens], dtype=torch.int64, device=device)  # 转换为张量并移动到指定设备
-
+    print("设备名称"+str(device))
     # 将输入添加到调度器，获取任务唯一ID
     seq_id = scheduler.add_sequence_pro(input_ids)
 
@@ -236,7 +272,7 @@ async def get_result(seq_id: int):
     if seq_id in scheduler.sequences:
         # 获取生成的token ID序列并解码为文本
         generated_ids = scheduler.sequences[seq_id]
-        generated_tokens = tokenizer.decode(generated_ids[0].tolist())
+        generated_tokens = qwen_tokenizer.decode(generated_ids[0].tolist())
 
         # 判断任务状态：活跃（处理中）或已完成
         if seq_id in scheduler.active_sequences:

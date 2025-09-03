@@ -82,7 +82,7 @@ class KVCache:
         ]
 
         # 计算槽映射（slot mappings）：每个token在缓存中的位置（块ID * 块大小 + token在块内的偏移）
-        #逻辑位置到物理位置的映射
+        #逻辑位置映射
         slot_mappings = [
             torch.arange(seq_len, dtype=torch.long, device='cuda') + block * self.block_size 
             for block in allocated
@@ -171,3 +171,21 @@ class KVCache:
             del self.allocated_blocks[seq_id]
             del self.block_tables[seq_id]
             del self.paged_attention_block_tables[seq_id]
+
+    def freeOneBlock(self, seq_id: int,block_table_index: int,
+                        block_num: int):
+        """
+        回收对应的Blcok
+        """
+        del self.block_tables[seq_id][block_table_index]
+        self.allocated_blocks[seq_id].remove(block_num)
+        self.free_blocks.append(block_num)
+
+    def free_paged_attention_block_tables(self, seq_id: int,
+                                          layer_index: int,
+                                          paged_attention_block_table_index: int):
+        """
+        回收对应的分页注意力块表
+        """
+        self.paged_attention_block_tables[seq_id][layer_index][0][paged_attention_block_table_index]=-1
+        

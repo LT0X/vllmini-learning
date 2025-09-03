@@ -2,6 +2,7 @@ import time
 from queue import PriorityQueue
 from typing import List, Dict, Tuple
 import torch
+import traceback 
 import torch.nn.functional as F
 from .block_manager import BlockManager
 from vllmini.model.gpt2 import GPT2LMHeadModel
@@ -11,9 +12,12 @@ from vllmini.speculative_decoding import LLMSpeculativeDecoding
 class Scheduler:
 
     
-    def __init__(self, model:GPT2LMHeadModel, block_manager:BlockManager,speculative_decoding:LLMSpeculativeDecoding,max_length: int):
-        self.model = model
-        self.model = self.model.to(torch.float16)  # 使用半精度浮点数减少内存占用
+    def __init__(self, model:GPT2LMHeadModel, block_manager:BlockManager,
+                 max_length: int,speculative_decoding:LLMSpeculativeDecoding,
+                 max_speculative_steps: int):
+        self.model = model 
+        if model != None:
+            self.model = self.model.to(torch.float16)  # 使用半精度浮点数减少内存占用
         self.block_manager = block_manager  # 负责KV缓存块的分配和管理
         self.max_length = max_length  # 序列的最大生成长度
         self.queue = PriorityQueue()  # 待处理序列的优先级队列
@@ -25,7 +29,7 @@ class Scheduler:
         self.id_set = set() #用于进行投机解码请求的逻辑判断
         self.last_main_logits: Dict[int, torch.Tensor] = {} #保存主模型预测结果
         self.last_draft_logits: Dict[int, torch.Tensor] = {} #保存草稿模型预测结果
-        self.max_speculative_steps: int #投机解码候选码预测的步数
+        self.max_speculative_steps: int = max_speculative_steps #投机解码候选码预测的步数
         self.seq_len : int #初始序列长度
 
     def add_sequence(self, input_ids: torch.Tensor):
@@ -74,16 +78,23 @@ class Scheduler:
         
 
         seq_len = input_ids.size(1)
-        num_layers = len(self.model.transformer.h)
-        
+        # num_layers = len(self.model.transformer.h)
+          
         #获取草稿和主模型prefill阶段logits
-        draft_lofits = self.speculative_decoding.prefill(seq_id,num_layers, seq_len,input_ids,0)
-        main_logits = self.speculative_decoding.prefill(seq_id,num_layers, seq_len,input_ids,1)
         
+        draft_lofits = self.speculative_decoding.prefill(seq_id, seq_len,input_ids,0)
+        print(str(seq_id)+"主模型prefill阶段完成")
+        main_logits = self.speculative_decoding.prefill(seq_id, seq_len,input_ids,1)
+        print(str(seq_id)+"草稿模型prefill阶段完成")
+        
+        print("prefill 主模型 logits"+str(main_logits[:, -1, :].shape))
+        print("prefill 草稿模型 logits"+str(draft_lofits.shape))
+
         self.last_main_logits[seq_id] = main_logits[:, -1, :]
         self.last_draft_logits[seq_id] = draft_lofits[:, -1, :]
         self.sequence_lengths[seq_id] = seq_len
         self.sequences[seq_id] = input_ids
+        self.seq_len = seq_len
         print(f"P  refill complete for sequence {seq_id}, length: {seq_len}")
         return seq_id
     
@@ -111,31 +122,70 @@ class Scheduler:
                     continue
                 
                 draft_tokens = []
+                draft_logits = []
+                
+                # print(self.id_set)
                 #进行草稿生成候选码
                 if seq_id in self.id_set:
                     #每一次需丢弃draftmodel的缓存，重新编码
+                    print("投机解码模式开始工作")
                     if self.sequence_lengths[seq_id] != self.seq_len:
-                        self.speculative_decoding.prefill()
-                         
+                        self.speculative_decoding.prefill(
+                            seq_id = seq_id,
+                            seq_len=self.sequence_lengths[seq_id],
+                            input_ids=self.sequences[seq_id],
+                            model_type=1
+                        )
+                        print("草稿模型prefill阶段完成")
+                    
+                    sequence_lengths = self.sequence_lengths[seq_id]
                     for i in range(self.max_speculative_steps):
-                        next_token = self.sample_next_token(seq_id)                         
-                        draft_tokens.append(next_token)
-                        
-                        draft_last_logits = self.speculative_decoding.generate_draft_tokens()
-                        self.last_draft_logits[seq_id] = draft_last_logits[:, -1, :]
 
+                        draft_logits.append(self.last_draft_logits[seq_id].unsqueeze(1))
+                        next_token = self.sample_next_token_pro(seq_id,0)
+                        print("生产的token是：")                         
+                        print(next_token)
+                        input_ids = next_token.unsqueeze(0)
+                        draft_tokens.append(input_ids)
+                    
+                        is_last = False
+                        if i == self.max_speculative_steps - 1:
+                            is_last = True
+
+                        draft_last_logits = self.speculative_decoding.generate_draft_tokens(
+                            input_ids= input_ids,
+                            is_last=is_last,
+                            seq_id=seq_id,
+                            sequence_lengths=sequence_lengths
+                        )
+                        self.last_draft_logits[seq_id] = draft_last_logits[:, -1, :]
+                        sequence_lengths +=1
+                    
+                    input_ids = torch.cat(draft_tokens,dim=-1)
+                    print(str(self.last_main_logits[seq_id].shape)+"主模型last_logit")
                     #进行主模型并行token验证
-                    accept_length,last_logits = self.speculative_decoding.verify_candidates()
+                    accept_length,last_logits = self.speculative_decoding.validate_draft_tokens(
+                        input_ids= input_ids,
+                        draft_tokens=draft_tokens,
+                        seq_id=seq_id,
+                        draft_logits=draft_logits,
+                        sequence_length=sequence_lengths,
+                        first_main_logit=self.last_main_logits[seq_id].unsqueeze(1)
+                    )
+                    
+                    print("接受长度"+str(accept_length))
                     current_sequence = self.sequences[seq_id]
                     
                     for i in range(accept_length):
-                        current_sequence = torch.cat([current_sequence, draft_tokens[i]],dim=-1)
+                        token = draft_tokens[i].to("cuda")
+                        current_sequence = torch.cat([current_sequence, token],dim=-1)
                         self.sequences[seq_id] = current_sequence
                     next_token = draft_tokens[accept_length-1]
                     #候选token全部接受，需生成下一个token    
                     if accept_length == self.max_speculative_steps:  
                         self.last_main_logits[seq_id] = last_logits
                         next_token = self.sample_next_token_pro(seq_id,1)
+
                         current_sequence = self.sequences[seq_id]
                         self.sequences[seq_id] = torch.cat([current_sequence, next_token.unsqueeze(0)], dim=-1)
    
@@ -161,7 +211,7 @@ class Scheduler:
                         use_cache=True,
                         is_prefill=False,
                         key_cache=key_cache,
-                        value_cache=value_cache,
+                        value_cache=value_cache, 
                         slot_mappings=new_slot_mappings,
                         block_tables=paged_attention_block_table,
                         seq_lens=torch.tensor([self.sequence_lengths[seq_id]], dtype=torch.int32, device=input_ids.device),
@@ -172,7 +222,17 @@ class Scheduler:
                     self.sequence_lengths[seq_id] += 1
 
                 # 检查是否完成生成（遇到EOS或达到最大长度）
-                if next_token.item() != self.model.config.eos_token_id and self.sequence_lengths[seq_id] < self.max_length:
+                eos_token_id = None
+                if self.model != None:
+                    eos_token_id = self.model.config.eos_token_id
+                else:
+                    eos_token_id = self.speculative_decoding.eos_token_id
+                print("最终阶段")
+                print(f"Sequence {seq_id} completed or reached max_length, final length: {self.sequence_lengths[seq_id]}")
+                del self.active_sequences[seq_id]
+                continue
+
+                if next_token.item() != eos_token_id and self.sequence_lengths[seq_id] < self.max_length:
                     self.queue.put((self.active_sequences[seq_id], seq_id))
                     print(f"Re-queued sequence {seq_id}, current length: {self.sequence_lengths[seq_id]}")
                 else:
@@ -180,8 +240,10 @@ class Scheduler:
                     self.remove_sequence_from_processing(seq_id)
 
 
-            except RuntimeError as e:
+            except Exception as e:
                 print(f"Error processing sequence {seq_id}: {str(e)}")
+                error_trace = traceback.format_exc()
+                print(f"Error occurred at: {error_trace}")
                 if "CUDA out of memory" in str(e):
                     self.handle_out_of_memory([seq_id])
                 else:
@@ -244,6 +306,16 @@ class Scheduler:
             probs = F.softmax(top_k_logits, dim=-1)
             next_token_index = torch.multinomial(probs, num_samples=1)
             next_token = top_k_indices[0, next_token_index[0]]
+            
+            probs = F.softmax(logits, dim=-1)
+            logits = logits.unsqueeze(1)
+            probs2 = F.softmax(logits, dim=-1)
+            print("采样的token是"+str(next_token))
+            print(probs.shape)
+            print(probs[0,next_token])
+            
+            print("hello world")
+
         elif modle_type == 1:
             #1 代表主模型
             logits = self.last_main_logits[seq_id]

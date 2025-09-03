@@ -215,3 +215,61 @@ class BlockManager:
         except RuntimeError: 
             # 若分配失败（如GPU内存不足），返回False
             return False
+        
+    def reback_kvcache(self, seq_id: int,back_length: int):
+        """
+        主模型拒绝了草稿，需要将对应的KV缓存进行回退
+        """
+        block_table =self.kv_cache.get_block_table(seq_id)
+        paged_attention_block_table =self.kv_cache.get_paged_attention_block_table(seq_id)
+        
+        for i in range(back_length):
+             # 遍历每个Transformer层的块表
+            for layer_idx, layer_blocks in enumerate(paged_attention_block_table):
+                last_block = -1  # 记录当前层的最后一个有效块
+                paged_attention_block_index = None
+                # 查找最后一个填充的块（通过块表中的-1标记未使用位置）
+                for i in range(1, len(layer_blocks[0])):
+                    if layer_blocks[0][i] == -1:
+                        last_block = layer_blocks[0][i-1]  # 最后一个有效块ID
+                        paged_attention_block_index = i - 1
+                        break
+                
+                # 查找最后一个块的详细信息（块ID和已填充数量）
+                last_block_info = None
+                block_table_index = -1
+                for (block, filled) in block_table:
+                    if block == last_block:
+                        last_block_info = (block, filled)
+                        block_table_index +=1
+                        break
+                
+                block_num, num_filled = last_block_info 
+                if num_filled != 1:
+                    #无需回收block,需要更新对应的元数据
+                    self.kv_cache.update_block_table(seq_id, block_num, num_filled-1)
+                else:
+                    #token回退后，这个block填充0个token,需要进行回收
+                    self.kv_cache.freeOneBlock(
+                        seq_id=seq_id,
+                        block_table_index= block_table_index,
+                        block_num=block_num
+                        
+                    )
+                    self.kv_cache.free_paged_attention_block_tables(seq_id,layer_idx,paged_attention_block_index)
+                     
+                    
+                    
+                    
+
+                    
+
+    
+
+
+
+            
+
+        
+        
+

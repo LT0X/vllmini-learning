@@ -1,8 +1,25 @@
+
+#pytest vllmini/tests/model/test_gpt2.py::TestGPT2WithPagedAttention::test_prefill_and_decode_one_token -v -s
+# 获取当前文件所在目录
+import os
+import sys
+
+current_file_path = os.path.abspath(__file__)
+# 计算项目根目录（根据你的路径结构需要向上退3级）
+project_root = os.path.abspath(os.path.join(current_file_path, "../../../.."))
+print(project_root)
+# 将项目根目录添加到Python的搜索路径
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+
 import torch
 import unittest
 from vllmini.model.gpt2 import GPT2LMHeadModel
 from transformers import GPT2Tokenizer, GPT2Config
 
+
+path = "/home/xtc/.cache/huggingface/hub/models--gpt2"
 def generate_triangular_mask(batch_size, num_heads, seq_len):
     # Create an upper triangular matrix with -inf, including the diagonal
     upper_triangular = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
@@ -101,17 +118,20 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
                 value_cache=value_cache,
                 slot_mappings=slot_mapping
             )
-
+        # print(type(kv_cache))
         self.assertIsNotNone(prefill_outputs[0])  # Check if logits are produced
-        self.assertIsNotNone(prefill_outputs[1])  # Check if key-value cache is produced
-        self.assertEqual(len(prefill_outputs[1]), self.config.num_hidden_layers)  # Check if cache is produced for all layers
+        self.assertIsNotNone(kv_cache)  # Check if key-value cache is produced
+        self.assertEqual(len(kv_cache), self.config.num_hidden_layers)  # Check if cache is produced for all layers
         
         # Check if caches are populated
         self.assertFalse(torch.all(key_cache == 0))
         self.assertFalse(torch.all(value_cache == 0))
+        
+        
 
+        # Generate the next token
         # Sample from the last logits to get the next token
-        last_token_logits = prefill_outputs[0][0, -1, :]
+        last_token_logits = prefill_outputs[0, -1, :]
         probs = torch.softmax(last_token_logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
 
@@ -134,7 +154,11 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
 
         # Prepare sequence lengths
         seq_lens = torch.tensor([current_length], dtype=torch.int32, device=self.device)
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
+        # key_cache, value_cache = kv_cache[0], kv_cache[1] #错误代码
+        
+        non_zero_mask = key_cache != 0
+        non_zero_values = key_cache[non_zero_mask]
+        # print(non_zero_values)
         
         with torch.no_grad():
             decode_outputs = self.model(
@@ -161,8 +185,11 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
 
         # Decode the generated tokens
         generated_text = self.tokenizer.decode(generated_ids[0])
+       
         print(f"Input text: {input_text}")
         print(f"Generated text: {generated_text}")
+        token = self.tokenizer.decode(next_token)
+        print(f"decode Generated token: {token}")
 
         # Additional checks
         self.assertNotEqual(input_text, generated_text)  # Ensure something was generated

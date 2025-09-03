@@ -1,3 +1,4 @@
+import time
 import torch
 from torch import nn
 from transformers import GPT2Config
@@ -40,8 +41,25 @@ class GPT2Attention(nn.Module):
         k = k.view(-1, self.num_heads, self.head_dim)
         v = v.view(-1, self.num_heads, self.head_dim)
 
+        # non_zero_mask = key_cache != 0
+        # non_zero_elements = key_cache[non_zero_mask]
+        # print("索引为"+str(len(torch.nonzero(non_zero_mask).squeeze())))
+        # print("索引为"+str(torch.nonzero(non_zero_mask).squeeze().shape))
+        
         # Always cache k and v using the reshape_and_cache kernel
         self._cache_kv(k, v, key_cache, value_cache, slot_mapping)
+
+        # print("k 为这个"+str(k.shape))
+        # print ("k 为这个"+str(len(k)))
+        # # print("v 为这个"+str(v))
+        # # print("key_cache 为这个"+str(key_cache))
+        # # print("value_cache 为这个"+str(value_cache))
+        # non_zero_mask = key_cache != 0
+        # non_zero_elements = key_cache[non_zero_mask]
+        # 
+        # # print("key_cache 为这个"+str(non_zero_elements))
+        # print("------------------------------------------------------------")
+        # time.sleep(2)
 
         if is_prefill:
             # For prefill, we need to use the attention mask and perform full attention

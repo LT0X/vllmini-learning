@@ -12,15 +12,25 @@
             "request": "launch",
             "module": "vllmini.main",  // 指定模块名（不带.py后缀）
             "console": "integratedTerminal",
+            "args": ["-spdecode"]
             
           },
-          
+           
           {
                "name": "Python run",
-               "type": "python",
+               "type": "debugpy",
                "request": "launch",
                "module": "vllmini.main",
-               "console": "integratedTerminal"
+               "console": "integratedTerminal",
+               "args": ["-spdecode"]
+          },
+          {
+               "name": "Python run",
+               "type": "debugpy",
+               "request": "launch",
+               "console": "integratedTerminal",
           }
+
+
      ]
 }

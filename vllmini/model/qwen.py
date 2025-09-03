@@ -1,11 +1,11 @@
 import torch
 from torch import nn
-from transformers import QwenConfig
+from transformers import AutoConfig
 from typing import List, Optional, Tuple
 from paged_attention_cuda import paged_attention_v1, cache_ops
 
 class QwenAttention(nn.Module):
-    def __init__(self, config: QwenConfig):
+    def __init__(self, config: AutoConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
@@ -164,7 +164,7 @@ class QwenAttention(nn.Module):
         return out
 
 class QwenMLP(nn.Module):
-    def __init__(self, config: QwenConfig):
+    def __init__(self, config: AutoConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -183,7 +183,7 @@ class QwenMLP(nn.Module):
         return hidden_states
 
 class QwenBlock(nn.Module):
-    def __init__(self, config: QwenConfig):
+    def __init__(self, config: AutoConfig):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.attn = QwenAttention(config)
@@ -234,7 +234,7 @@ class QwenBlock(nn.Module):
         return outputs
 
 class QwenModel(nn.Module):
-    def __init__(self, config: QwenConfig):
+    def __init__(self, config: AutoConfig):
         super().__init__()
         self.config = config
         self.wte = nn.Embedding(config.vocab_size, config.hidden_size)  # 词嵌入
@@ -286,7 +286,7 @@ class QwenModel(nn.Module):
         return hidden_states, presents
 
 class QwenLMHeadModel(nn.Module):
-    def __init__(self, config: QwenConfig):
+    def __init__(self, config: AutoConfig):
         super().__init__()
         self.config = config
         self.transformer = QwenModel(config)
