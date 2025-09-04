@@ -480,15 +480,105 @@ def decode_step(self, seq_id: int, input_len: int) -> Tuple[List[List[int]], tor
 
 ### speculative_decoding
 
-​	speculative_decoding是本次需要在原来的项目的基础上添加的一个组件，主要是负责项目中推理的时候的投机解码，因为是基于原来项目添加对应的相应的代码，所以理所当然的，组件需要适配项目的技术特性，如本项目的相关组件，schedule，block_manager，kv_cache，以及page_attention，所以在原有的项目更新和添加组件需要处理一下兼容性的问题，同时项目的模型结构，模型参数，以及分词器tokenizer等主要运用的是GPT2模型，这次要用到主模型和草稿模型主要使用的是Qwen系列，原项目因为各方面的技术特性都是自己coding 的，所以为了兼容自己所写的特性，原项目也是创建了gpt2自己实现了模型核心结构，也就是说，要添加组件并进行特性兼容的情况的下，我也得自己实现对应的主模型和草稿模型的核心的结构，同时还得进行兼容的设计，这一点我感觉是最难的点，虽然最后实现了个基本情况，且把投机解码逻辑处理代码完成书写，但因个人可能关于大模型这方面关掌握可能还不是很熟练，项目在decode阶段生成的文本内容总是不理想，且有一些bug还未完成修复，这些问题困惑很久还是未能解决，遂决定先书写完文档再继续解决，后解决后会同步更新对应文档。
+​	speculative_decoding是本次需要在原来的项目的基础上添加的一个组件，主要是负责项目中推理的时候的投机解码，因为是基于原来项目添加对应的相应的代码，所以理所当然的，组件需要适配项目的技术特性，如本项目的相关组件，`schedule，block_manager，kv_cache，`以及`page_attention，`所以在原有的项目更新和添加组件需要处理一下兼容性的问题，同时项目的模型结构，模型参数，以及分词器`tokenizer`等主要运用的是`GPT2`模型，这次要用到主模型和草稿模型主要使用的是`Qwen`系列，原项目因为各方面的技术特性都是自己`coding` 的，所以为了兼容自己所写的特性，原项目也是创建了`gpt2`自己实现了模型核心结构，也就是说，要添加组件并进行特性兼容的情况的下，我也得自己实现对应的主模型和草稿模型的核心的结构，同时还得进行兼容的设计，这一点我感觉是最难的点，虽然最后实现了个基本情况，且把投机解码逻辑处理代码完成书写，但因个人可能关于大模型这方面关掌握可能还不是很熟练，项目在`decode`阶段生成的文本内容总是不理想，且有一些bug还未完成修复，这些问题困惑很久还是未能解决，遂决定先书写完文档再继续解决，后解决后会同步更新对应文档。
 
 ### 项目投机解码架构图
 
+![ ](https://i-blog.csdnimg.cn/direct/5304d512c8cb46b2ae728b6c1ed3e085.png)
+
+​	首先在添加speculative_decoding组件的时候，我是想尽可能保留原来项目的基础功能，也就是保留以GPT2为基础的单模型推理功能，尽可能不做侵略代码的书写，所以我在启动项目的命令行添加相关参数识别以便区别先前的启动方式，后续启动和初始化组件则以投机解码的形式去启动。
+
+```python
+from vllmini.modle_type import IsSpdecode
+
+if __name__ == "__main__":
+
+    #添加参数启动，选用投机解码模式
+    parser = argparse.ArgumentParser(description='工作模式')
+    parser.add_argument('-spdecode', '--SpeculativeDecoding',
+                        action='store_true', help='投机解码')
+    isSpdecode =  parser.parse_args().SpeculativeDecoding
+    print("isSpdecode的参数是什么 "+str(isSpdecode))
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+​	`IsSpdecode`参数主要作为模式识别的依据，后续根据这个进行分支初始化组件，在架构设计中，调度器`schedule`的下一层组件则是本次添加的组件`LLMSpeculativeDecoding`，本次可能以`SpeculativeDecoding`为中心进行设计，而调度器的除了调度序列的任务的作，还进行投机解码任务外部处理逻辑的补充，`SpeculativeDecoding`主要的两大职责则是进行草稿token的产生以及对于草稿token的验证，需要用到进行模型推理，所以由`SpeculativeDecoding` 进行管理主模型和草稿模型 ，另外一方面，由于需进行模型推理同时兼容原项目特性，则需要用到项目中`kv_cache`以及`page_attention`，所以理所当然的需要在`SpeculativeDecoding`进行`block_manager`组件的注册，在架构图中，是分为了`main_block_manager` 和 `draft_block_manager`,首先，虽然本次选用的是同一系列的模型，但是主模型和草稿模型还是会有参数数量的不同以及其他差异，所以显而易见的kv_cache是不能共享的，所以主模型和草稿模型需要独立的kv_cache，虽然可能可以在block_manager 进行相应的修改和扩展，使得block_manaer进行两套kv_cache的管理，但是我在一开始就说明，我尽量不做侵略性的代码的书写，尽可能保留原有项目的基础功能而去扩展，所以这次直接是为`SpeculativeDecoding` 注册了`main_block_manager`和`draft_block_manager`，这样只需要少量更新代码，就可以起到扩展和隔离的效果。
+
+```
+#对于初始化投机解码组件封装函数，尽可能避免在原组件直接添加代码
+def init_LLMSpeculativeDecoding(main_model_path: str,draft_model_path: str,
+                                main_config:Qwen2Config ,draft_config: Qwen2Config):
+    
+    global qwen_tokenizer
+    
+    num_blocks = 1000  # 总缓存块数量
+    block_size = 16    #一个block存储的token数量
+    max_blocks_per_seq =4 #每一层一个序列最多可使用的缓存块数量
+    max_speculative_steps = 1 #草稿预测的步数
+
+    main_model = Qwen2LMHeadModel(main_config)
+    draft_model = Qwen2LMHeadModel(draft_config)
+    main_model.load_huggingface_weights(main_model_path)
+    draft_model.load_huggingface_weights(draft_model_path)
+    main_model.to(device)
+    # draft_model.to("cpu")
+    
+    qwen_tokenizer = Qwen2Tokenizer.from_pretrained(main_model_path)
+
+    main_block_manager = BlockManager(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_heads=main_config.num_attention_heads,
+        head_size=main_config.hidden_size // main_config.num_attention_heads,
+        max_blocks_per_seq=max_blocks_per_seq
+    )
+
+    draft_block_manager = BlockManager(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_heads=draft_config.num_attention_heads,
+        head_size=draft_config.hidden_size // draft_config.num_attention_heads,
+        max_blocks_per_seq=max_blocks_per_seq
+    )
+
+    speculative_decoding  = LLMSpeculativeDecoding(
+        main_model= main_model,
+        draft_model= draft_model,
+        main_block_manager= main_block_manager,
+        draft_block_manager= draft_block_manager,
+        tokenizer=tokenizer,
+        max_speculative_steps=max_speculative_steps,
+        eos_token_id=main_config.eos_token_id
+    )
+
+    return main_model, draft_model,main_block_manager,draft_block_manager,speculative_decoding
+```
+
+​	明天继续更新。。。。。。
 
 
-![img](https://i-blog.csdnimg.cn/direct/5304d512c8cb46b2ae728b6c1ed3e085.png)
 
-今天先更新到这里， 明天继续更新代码部分。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
