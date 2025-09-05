@@ -486,7 +486,7 @@ def decode_step(self, seq_id: int, input_len: int) -> Tuple[List[List[int]], tor
 
 ![ ](https://i-blog.csdnimg.cn/direct/5304d512c8cb46b2ae728b6c1ed3e085.png)
 
-​	首先在添加speculative_decoding组件的时候，我是想尽可能保留原来项目的基础功能，也就是保留以GPT2为基础的单模型推理功能，尽可能不做侵略代码的书写，所以我在启动项目的命令行添加相关参数识别以便区别先前的启动方式，后续启动和初始化组件则以投机解码的形式去启动。
+​	首先在添加`speculative_decoding`组件的时候，我是想尽可能保留原来项目的基础功能，也就是保留以GPT2为基础的单模型推理功能，尽可能不做侵略代码的书写，所以我在启动项目的命令行添加相关参数识别以便区别先前的启动方式，后续启动和初始化组件则以投机解码的形式去启动。
 
 ```python
 from vllmini.modle_type import IsSpdecode
@@ -554,7 +554,316 @@ def init_LLMSpeculativeDecoding(main_model_path: str,draft_model_path: str,
     return main_model, draft_model,main_block_manager,draft_block_manager,speculative_decoding
 ```
 
-​	明天继续更新。。。。。。
+​	为了区分之前的接口，所以在server创建了一些新的接口， 分别为 `/generatePro`和`/resultPro/{seq_id}`，分别代表着之前的 生产token的接口以及查询推理结构的接口，接口在server层的处理逻辑与原先项目的处理大致相同，这里不再赘述。
+
+​	经过了server层，下一部分则是在调度器的层面进行处理，添加新序列到调度器，同时在处理完毕后，需要进行seq_id的返回，在添加序列的过程的中，需要分别对主模型和草稿模型进行prefill 阶段，这一步的步骤可以使得两个模型分别生成自己的kv_cache，因为在这之前也以及说明，由于参数和结构层数的不同，两者的kv_cache是不能共享，另外这会使得两模型经前向传播产生下一个token 的logits。  
+
+```python
+def add_sequence_pro(self, input_ids: torch.Tensor):
+        """添加新序列到调度器"""
+        arrival_time = time.time()
+        seq_id = self._generate_seq_id()
+        self.queue.put((arrival_time, seq_id))
+        self.active_sequences[seq_id] = arrival_time
+        self.id_set.add(seq_id)
+        
+
+        seq_len = input_ids.size(1)
+        # num_layers = len(self.model.transformer.h)
+          
+        #获取草稿和主模型prefill阶段logits
+        
+        draft_lofits = self.speculative_decoding.prefill(seq_id, seq_len,input_ids,0)
+        print(str(seq_id)+"主模型prefill阶段完成")
+        main_logits = self.speculative_decoding.prefill(seq_id, seq_len,input_ids,1)
+        print(str(seq_id)+"草稿模型prefill阶段完成")
+        
+        print("prefill 主模型 logits"+str(main_logits[:, -1, :].shape))
+        print("prefill 草稿模型 logits"+str(draft_lofits.shape))
+
+        self.last_main_logits[seq_id] = main_logits[:, -1, :]
+        self.last_draft_logits[seq_id] = draft_lofits[:, -1, :]
+        self.sequence_lengths[seq_id] = seq_len
+        self.sequences[seq_id] = input_ids
+        self.seq_len = seq_len
+        print(f"P  refill complete for sequence {seq_id}, length: {seq_len}")
+        return seq_id
+```
+
+​	在调度器循环调度到对应的序列的时候，设计每一次循环调度处理序列 `max_speculative_steps`个token，直到后续序列完成生成， 进入序列任务decode阶段，首先需要初始化 `draft_tokens`和 `draft_logits`，每一次内层草稿模型decode循环都需要进行更新，以便后续传输参数给主模型进行验证，同时在每一次的序列任务开始都需要重新对草稿模型对现有序列重新进行prefill阶段，因为在每次主模型验证后，都需要清除草稿模型对应的缓存，这是为了草稿模型和主模型上下文一致的问题，这一个问题后面再详细展开。
+
+​	进入序列调度，前面进行一系列的初始化活动后，后面会进行 `max_speculative_steps`次循环，每一次循环都会调用`generate_draft_tokens` 生成一个候选token， 生成设定数量的 `draft_tokens` 后会进行整合，然后进行准备参数，紧接着进行投机解码组件的 `validate_draft_tokens`函数，进行草稿token的验证，函数返回接受长度，以及主模型推理后返回接受长度的last_logit，以便后续可以进行采样下一个token，然后根据`accept_length`决定后续处理逻，如果accept_length为0，则表示主模型没有接受草稿模型的候选token，需要由主模型自己根据logits生成token加入序列当中，紧接着则是一些 任务序列完成程度以及长度限制的检测。
+
+```python
+    def run(self):
+        """运行调度循环，处理队列中的所有序列"""
+        while not self.queue.empty():
+            print(f"Active sequences: {self.active_sequences}")
+            print(f"Queue size: {self.queue.qsize()}")
+            
+            _, seq_id = self.queue.get()
+            print(f"Processing sequence {seq_id}")
+
+            if seq_id not in self.active_sequences:
+                print(f"Sequence {seq_id} is no longer active, skipping")
+                continue
+
+            try: 
+                print("current sequence_lengths in run:", self.sequence_lengths)
+                print(f"Processing sequence {seq_id}, current length: {self.sequence_lengths[seq_id]}")
+                
+                # 检查是否达到最大长度
+                if self.sequence_lengths[seq_id] >= self.max_length:
+                    print(f"Sequence {seq_id} has reached max_length, ending generation")
+                    self.remove_sequence_from_processing(seq_id)
+                    continue
+                
+                draft_tokens = []
+                draft_logits = []
+                
+                # print(self.id_set)
+                #进行草稿生成候选码
+                if seq_id in self.id_set:
+                    #每一次需丢弃draftmodel的缓存，重新编码
+                    print("投机解码模式开始工作")
+                    if self.sequence_lengths[seq_id] != self.seq_len:
+                        self.speculative_decoding.prefill(
+                            seq_id = seq_id,
+                            seq_len=self.sequence_lengths[seq_id],
+                            input_ids=self.sequences[seq_id],
+                            model_type=1
+                        )
+                        print("草稿模型prefill阶段完成")
+                    
+                    sequence_lengths = self.sequence_lengths[seq_id]
+                    for i in range(self.max_speculative_steps):
+
+                        draft_logits.append(self.last_draft_logits[seq_id].unsqueeze(1))
+                        next_token = self.sample_next_token_pro(seq_id,0)
+                        print("生产的token是：")                         
+                        print(next_token)
+                        input_ids = next_token.unsqueeze(0)
+                        draft_tokens.append(input_ids)
+                    
+                        is_last = False
+                        if i == self.max_speculative_steps - 1:
+                            is_last = True
+
+                        draft_last_logits = self.speculative_decoding.generate_draft_tokens(
+                            input_ids= input_ids,
+                            is_last=is_last,
+                            seq_id=seq_id,
+                            sequence_lengths=sequence_lengths
+                        )
+                        self.last_draft_logits[seq_id] = draft_last_logits[:, -1, :]
+                        sequence_lengths +=1
+                    
+                    input_ids = torch.cat(draft_tokens,dim=-1)
+                    print(str(self.last_main_logits[seq_id].shape)+"主模型last_logit")
+                    #进行主模型并行token验证
+                    accept_length,last_logits = self.speculative_decoding.validate_draft_tokens(
+                        input_ids= input_ids,
+                        draft_tokens=draft_tokens,
+                        seq_id=seq_id,
+                        draft_logits=draft_logits,
+                        sequence_length=sequence_lengths,
+                        first_main_logit=self.last_main_logits[seq_id].unsqueeze(1)
+                    )
+                    
+                    print("接受长度"+str(accept_length))
+                    current_sequence = self.sequences[seq_id]
+                    
+                    for i in range(accept_length):
+                        token = draft_tokens[i].to("cuda")
+                        current_sequence = torch.cat([current_sequence, token],dim=-1)
+                        self.sequences[seq_id] = current_sequence
+                    next_token = draft_tokens[accept_length-1]
+                      
+                    self.last_main_logits[seq_id] = last_logits  
+                    #候选token全部接受，需生成下一个token  
+                    if accept_length == 0:                          
+                        next_token = self.sample_next_token_pro(seq_id,1)
+                        current_sequence = self.sequences[seq_id]
+                        self.sequences[seq_id] = torch.cat([current_sequence, next_token.unsqueeze(0)], dim=-1)
+   
+                else:  
+        			 #单模型推理
+                   	 .....................
+
+                # 检查是否完成生成（遇到EOS或达到最大长度）
+                eos_token_id = None
+                if self.model != None:
+                    eos_token_id = self.model.config.eos_token_id
+                else:
+                    eos_token_id = self.speculative_decoding.eos_token_id
+
+                if next_token.item() != eos_token_id and self.sequence_lengths[seq_id] < self.max_length:
+                    self.queue.put((self.active_sequences[seq_id], seq_id))
+                    print(f"Re-queued sequence {seq_id}, current length: {self.sequence_lengths[seq_id]}")
+                else:
+                    print(f"Sequence {seq_id} completed or reached max_length, final length: {self.sequence_lengths[seq_id]}")
+                    self.remove_sequence_from_processing(seq_id)
+```
+
+​	`speculative_decoding`主要的一个职责则是产生草稿模型的候选token，主要是由`generate_draft_tokens`函数实现的，其实大致实现和原项目的decode阶段类似，结合kv_cache每次都会产生一个token，不同的点的则是，如果检测到此次已经是`max_speculative_steps`的最后一次循环，代表本次产生本次循环最后一次token，需要清除对应的草稿模型的kv_cache，为什么需要清除草稿模型的kv_cache，前面也简单的提了一嘴，这是为了草稿模型和主模型上下文一致的问题。
+
+​	草稿模型和主模型的参数规模、网络结构往往会有差异，因此两者生成的`K`和`V`对应的特征空间完全不同。这是它们kv_cache不能共用的主要的原因，另外投机解码的核心目标是：**最终生成的序列完全由主模型的逻辑主导**，草稿模型主要用来快速试错，所以主模型的为主导的情况下，主模型的kv_cache是需要进行保留的，同时也是需要我们进行维护的，因为如果主模型部分接受或者全不接受草稿模型的候选token，主模型的kv_cache为了推理的文本的准确性，往往是需要进行kv_cache的部分回退的工作，以保证序列始终保持主模型上下文一致。并且这一部分往往是时间复杂度比较高的一项操作，特别在长序列当中消耗的时间会更为明显。
+
+​	而对于transfomer这种自回归模型，推理往往会依据前一个token和历史kv_cache进行上下文联系而推理出下一个token，而如果草稿模型的候选token部分接受，则从最后一个接受候选往后开始的所有token是作废的，这是由于自回归特性的决定，同时，如果草稿模型保留部分接受token的kv_cache进行回退，但实际很难能保证和主模型的一致性，若主模型与草稿模型的 token 序列在某个环节出现隐性不一致，可能token ID是一样的，但因编码逻辑差异导致实际语义偏差，回退的缓存可能引入潜在错误，影响后续草稿的质量，另外一方面是成本问题，往往草稿模型是参数相比于主模型来说是很小的，prefill并行推理重新编码的成本小的多，并且回退kv_cache是一项比较耗时的操作。
+
+```python
+def  generate_draft_tokens(
+        self,
+        input_ids: torch.Tensor,
+        is_last: bool,
+        seq_id:int,
+        sequence_lengths : int,
+        
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """使用草稿模型生成候选token"""
+
+         # 生成位置ID
+        position_ids = torch.tensor([sequence_lengths], device=input_ids.device)
+        
+        paged_attention_block_table, new_slot_mappings = self.draft_block_manager.decode_step(seq_id, 1)
+        key_cache, value_cache = (self.draft_block_manager.kv_cache.key_cache, 
+                                 self.draft_block_manager.kv_cache.value_cache)
+                    
+        logits, _ = self.draft_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            use_cache=True,
+            is_prefill=True,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mappings=new_slot_mappings,
+            block_tables=paged_attention_block_table,
+            seq_lens=torch.tensor([sequence_lengths], dtype=torch.int32, device=input_ids.device),
+            max_seq_len=self.draft_block_manager.kv_cache.max_blocks_per_seq * self.draft_block_manager.block_size
+                    )
+        if is_last:
+            #开始清除draft的kv_cache缓存
+            self.draft_block_manager.free(seq_id)
+            print()     
+        return logits
+```
+
+​	`speculative_decoding`另外一项工作则是利用主模型对候选token进行验证，这一过程和prefill阶段和decode阶段都有一些差异，不同于decode，每次基于上一个token和历史kv_cache 产生一个token，由于传入的是多个token,并且由于矩阵运算的特殊性，这里可以并行验证这样token,另外一点，同时需要加入对应的注意力掩码，防止前面的token看到后面的token，最后经过主模型推理得到经前向传播得到的logit，然后则需要进行对应的验证步骤。
+
+​	首先与采样函数保持一致，进行应用温度缩放，由于函数参数列表有了候选token的列表，所以需要进行一一验证， 首先主模型和草稿模型的logits分别进行 softmax()处理，得到对应的概率分别，根据候选token的ID从中获取对应的概率，然后对这两个进行运算，得到主模型和草稿模型的概率比，从而得到接受概率，首先这里会进行最低值验证，然后进行随机采样决定是否接受。后续需要根据`accepted_length`的长度进行返回结果和对应的logits,如果部分接受和全不接受，为了保证主模型的上下文一致，需要对主模型的kv_cache进行回退。
+
+```python
+def validate_draft_tokens(
+        self,
+        input_ids: torch.Tensor,
+        draft_tokens: list,
+        seq_id: int,
+        draft_logits: list,
+        sequence_length :int,
+        first_main_logit: torch.Tensor,
+    ) -> Tuple[int, torch.Tensor]:
+        """使用主模型验证候选token"""
+        # 将输入和候选token拼接
+        # all_tokens = torch.cat([input_ids, draft_tokens], dim=1)
+        draft_len = len(draft_tokens)
+        for i in range(draft_len):
+            draft_tokens[i] = torch.clone(draft_tokens[i]).cpu()
+        
+        # 生成位置ID
+        position_ids = torch.tensor([sequence_length], device=input_ids.device)
+       
+        #生成掩码
+        main_attention_mask = generate_triangular_mask(1, self.main_block_manager.num_heads,draft_len)
+        
+        #分配需要的KVcache
+
+        paged_attention_block_table =None , 
+        new_slot_mapping = None
+        for i in range(draft_len):
+            paged_attention_block_table,new_slot_mapping = self.main_block_manager.decode_step(seq_id, 1)
+        
+        main_logits, _ = self.main_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=main_attention_mask,
+                use_cache=True,
+                is_prefill=True,
+                key_cache=self.main_block_manager.kv_cache.key_cache,
+                value_cache=self.main_block_manager.kv_cache.value_cache,
+                slot_mappings=new_slot_mapping,
+                block_tables=paged_attention_block_table,
+                seq_lens=torch.tensor([sequence_length], dtype=torch.int32, device=input_ids.device),
+                max_seq_len=self.main_block_manager.kv_cache.max_blocks_per_seq * self.main_block_manager.block_size
+                    )
+        
+        last_logits = main_logits[:, -1, :]
+        
+        print(str(main_logits.shape)+"主模型logit 形状")
+        
+        for i in range(len(draft_tokens)):
+            print("这个 tokens 是"+ str(draft_tokens[i]))
+        
+        accepted_length = 0
+        temperature = 1.0  # 与采样函数保持一致的温度参数
+        
+        draft_logits = torch.cat(draft_logits,dim=1)   
+          
+        
+        print("first_main_logit"+ str(first_main_logit.shape))
+        main_logits = torch.cat([first_main_logit, main_logits[:, -draft_len-1:-1, :]], dim=1)
+        # 应用温度缩放
+        print(str(main_logits.shape)+"主模型logit 形状")
+        print(str(draft_logits.shape)+"草稿logit 形状")
+
+        main_logits_scaled = main_logits / temperature
+        draft_logits_scaled = draft_logits / temperature
+        
+        # 计算概率分布
+        # top_k = 50
+        # top_k_logits, top_k_indices = torch.topk(logits, top_k)
+        # main_probs = F.softmax(main_logits_scaled, dim=-1)
+        # draft_probs = F.softmax(draft_logits_scaled, dim=-1)
+        
+        # 遍历每个草稿token，判断是否接受
+        for i in range(draft_len):
+           
+            main_probs = F.softmax(main_logits_scaled[:,i,:], dim=-1)
+            
+            draft_probs = F.softmax(draft_logits_scaled[:,i,:], dim=-1)
+            
+            current_token = draft_tokens[i]
+            print("当前token:",str(current_token))
+            # 1. 获取主模型和草稿模型对当前token的概率
+            main_prob = main_probs[0, current_token]
+            draft_prob = draft_probs[0,current_token]
+
+            # 2. 计算接受概率：基于主模型与草稿模型的概率比，确保不超过1.0
+            # 这种方式更严谨，考虑了两个模型的概率分布对比
+            accept_prob = torch.min(torch.tensor(1.0, device=self.device), main_prob / draft_prob)
+            
+            # 3. 额外检查：如果主模型对该token的概率过低，直接拒绝
+            # 避免接受主模型本身认为极不可能的token
+            min_accept_prob = 0.01  # 可调整的最小接受概率阈值
+            if main_prob < min_accept_prob:
+               accepted_length = 0
+               break
+            
+            # 4. 执行随机采样决定是否接受
+            if torch.rand(1, device=self.device) < accept_prob:
+                accepted_length += 1
+            else:
+                break
+     
+        last_logits = main_logits[:, accepted_length, :]
+
+
+        #开始处理KV缓存
+        if accepted_length !=draft_len:
+            self.main_block_manager.reback_kvcache(seq_id,draft_len)
+        
+        return accepted_length, last_logits
+```
 
 
 
@@ -562,25 +871,51 @@ def init_LLMSpeculativeDecoding(main_model_path: str,draft_model_path: str,
 
 
 
+```python
+ def reback_kvcache(self, seq_id: int,back_length: int):
+        """
+        主模型拒绝了草稿，需要将对应的KV缓存进行回退
+        """
+        block_table =self.kv_cache.get_block_table(seq_id)
+        paged_attention_block_table =self.kv_cache.get_paged_attention_block_table(seq_id)
+        
+        for i in range(back_length):
+             # 遍历每个Transformer层的块表
+            for layer_idx, layer_blocks in enumerate(paged_attention_block_table):
+                last_block = -1  # 记录当前层的最后一个有效块
+                paged_attention_block_index = None
+                # 查找最后一个填充的块（通过块表中的-1标记未使用位置）
+                for i in range(1, len(layer_blocks[0])):
+                    if layer_blocks[0][i] == -1:
+                        last_block = layer_blocks[0][i-1]  # 最后一个有效块ID
+                        paged_attention_block_index = i - 1
+                        break
+                
+                # 查找最后一个块的详细信息（块ID和已填充数量）
+                last_block_info = None
+                block_table_index = -1
+                for (block, filled) in block_table:
+                    if block == last_block:
+                        last_block_info = (block, filled)
+                        block_table_index +=1
+                        break
+                
+                block_num, num_filled = last_block_info 
+                if num_filled != 1:
+                    #无需回收block,需要更新对应的元数据
+                    self.kv_cache.update_block_table(seq_id, block_num, num_filled-1)
+                else:
+                    #token回退后，这个block填充0个token,需要进行回收
+                    self.kv_cache.freeOneBlock(
+                        seq_id=seq_id,
+                        block_table_index= block_table_index,
+                        block_num=block_num
+                        
+                    )
+                    self.kv_cache.free_paged_attention_block_tables(seq_id,layer_idx,paged_attention_block_index)
+```
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+​	
 
 
 
